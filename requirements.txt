@@ -1,0 +1,26 @@
+# TensorRT Diffusion Model Optimization Pipeline
+# Core dependencies for NVIDIA T4 GPU optimization on Google Colab
+
+# PyTorch and TensorRT integration
+torch>=2.1.0
+torch-tensorrt>=2.1.0
+tensorrt>=8.6
+
+# NVIDIA Model Optimizer for INT8 PTQ
+nvidia-modelopt>=0.15.0
+
+# Diffusion model support
+diffusers>=0.25.0
+transformers>=4.36.0
+accelerate>=0.25.0
+
+# Image processing
+Pillow>=9.0.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# Development dependencies
+pytest>=7.0
+hypothesis>=6.0
+pytest-benchmark>=4.0
