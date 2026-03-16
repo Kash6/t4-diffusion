@@ -30,8 +30,14 @@ from .model_loader import (
     SUPPORTED_MODELS,
 )
 
+# Calibration component
+from .calibration import (
+    CalibrationEngine,
+    CalibrationConfig,
+    DEFAULT_CALIBRATION_PROMPTS,
+)
+
 # Core components will be imported here as they are implemented
-# from .calibration import CalibrationEngine, CalibrationConfig
 # from .quantizer import INT8Quantizer, QuantizationConfig
 # from .trt_builder import TensorRTBuilder, TRTConfig
 # from .cache_manager import CacheManager, CacheConfig
@@ -50,5 +56,9 @@ __all__ = [
     "ModelConfig",
     "OutOfMemoryError",
     "SUPPORTED_MODELS",
+    # Calibration
+    "CalibrationEngine",
+    "CalibrationConfig",
+    "DEFAULT_CALIBRATION_PROMPTS",
     # Components will be added as implemented
 ]
