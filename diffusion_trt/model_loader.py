@@ -10,14 +10,24 @@ Supported models:
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING
 import gc
 import time
 
 import torch
-from diffusers import DiffusionPipeline
 
 from .models import T4_VRAM_LIMIT_GB
+
+# Lazy import to avoid version conflicts on Colab
+# DiffusionPipeline is imported at runtime, not at module load time
+if TYPE_CHECKING:
+    from diffusers import DiffusionPipeline
+
+
+def _get_diffusion_pipeline():
+    """Lazy import of DiffusionPipeline to avoid import errors during testing."""
+    from diffusers import DiffusionPipeline
+    return DiffusionPipeline
 
 
 # Supported model identifiers
@@ -112,9 +122,9 @@ class ModelLoader:
             max_retries: Maximum number of retry attempts for model download
         """
         self._max_retries = max_retries
-        self._loaded_pipeline: Optional[DiffusionPipeline] = None
+        self._loaded_pipeline = None  # Type: Optional[DiffusionPipeline]
     
-    def load(self, config: ModelConfig) -> DiffusionPipeline:
+    def load(self, config: ModelConfig):
         """
         Load a diffusion pipeline with memory optimizations.
         
@@ -174,7 +184,7 @@ class ModelLoader:
         self._loaded_pipeline = pipeline
         return pipeline
     
-    def _load_with_retry(self, config: ModelConfig) -> DiffusionPipeline:
+    def _load_with_retry(self, config: ModelConfig):
         """
         Load model with exponential backoff retry logic.
         
@@ -187,6 +197,7 @@ class ModelLoader:
         Raises:
             RuntimeError: If all retry attempts fail
         """
+        DiffusionPipeline = _get_diffusion_pipeline()
         last_exception: Optional[Exception] = None
         
         for attempt in range(self._max_retries):
@@ -219,7 +230,7 @@ class ModelLoader:
             f"Last error: {last_exception}"
         )
     
-    def extract_unet(self, pipeline: DiffusionPipeline) -> torch.nn.Module:
+    def extract_unet(self, pipeline) -> torch.nn.Module:
         """
         Extract the UNet component from a diffusion pipeline for TensorRT optimization.
         

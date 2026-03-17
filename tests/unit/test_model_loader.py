@@ -161,17 +161,19 @@ class TestModelLoaderLoad:
     """Test ModelLoader.load() with mocked DiffusionPipeline."""
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=8 * 1024**3)  # 8GB
     @patch('torch.cuda.empty_cache')
     def test_load_applies_memory_optimizations(
-        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that load() applies attention slicing and VAE tiling."""
         # Setup mock pipeline
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
         loader = ModelLoader()
@@ -184,16 +186,18 @@ class TestModelLoaderLoad:
         mock_pipeline.to.assert_called_once_with("cuda")
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=8 * 1024**3)
     @patch('torch.cuda.empty_cache')
     def test_load_skips_optimizations_when_disabled(
-        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that load() skips optimizations when disabled in config."""
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(
             model_id="stabilityai/sdxl-turbo",
@@ -208,16 +212,18 @@ class TestModelLoaderLoad:
         mock_pipeline.enable_vae_tiling.assert_not_called()
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=8 * 1024**3)
     @patch('torch.cuda.empty_cache')
     def test_load_uses_fp16_dtype(
-        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that load() uses FP16 dtype by default."""
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
         loader = ModelLoader()
@@ -242,16 +248,18 @@ class TestModelLoaderLoad:
             loader.load(config)
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=17 * 1024**3)  # 17GB - exceeds limit
     @patch('torch.cuda.empty_cache')
     def test_load_raises_oom_when_vram_exceeded(
-        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that load() raises OutOfMemoryError when VRAM exceeds limit."""
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
         loader = ModelLoader()
@@ -272,22 +280,24 @@ class TestModelLoaderRetryLogic:
     """Test ModelLoader retry logic for failed downloads."""
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=8 * 1024**3)
     @patch('torch.cuda.empty_cache')
     @patch('time.sleep')  # Mock sleep to speed up tests
     def test_retry_on_download_failure(
-        self, mock_sleep, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_sleep, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that load() retries on download failure."""
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         # Fail twice, then succeed
         mock_pipeline_cls.from_pretrained.side_effect = [
             ConnectionError("Network error"),
             ConnectionError("Network error"),
             mock_pipeline,
         ]
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
         loader = ModelLoader(max_retries=3)
@@ -298,20 +308,22 @@ class TestModelLoaderRetryLogic:
         assert result == mock_pipeline
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.empty_cache')
     @patch('time.sleep')
     def test_retry_uses_exponential_backoff(
-        self, mock_sleep, mock_empty_cache, mock_cuda_avail, mock_pipeline_cls
+        self, mock_sleep, mock_empty_cache, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that retry uses exponential backoff timing."""
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.side_effect = [
             ConnectionError("Error 1"),
             ConnectionError("Error 2"),
             mock_pipeline,
         ]
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
         loader = ModelLoader(max_retries=3)
@@ -325,15 +337,17 @@ class TestModelLoaderRetryLogic:
         mock_sleep.assert_any_call(2)  # 2^1 = 2
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.empty_cache')
     @patch('time.sleep')
     def test_raises_after_max_retries(
-        self, mock_sleep, mock_empty_cache, mock_cuda_avail, mock_pipeline_cls
+        self, mock_sleep, mock_empty_cache, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that load() raises RuntimeError after max retries."""
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.side_effect = ConnectionError("Persistent error")
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
         loader = ModelLoader(max_retries=3)
@@ -505,17 +519,19 @@ class TestModelLoaderMemoryManagement:
         mock_gc.assert_called_once()
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=8 * 1024**3)
     @patch('torch.cuda.empty_cache')
     @patch('gc.collect')
     def test_clear_memory_clears_loaded_pipeline(
-        self, mock_gc, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_gc, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test that clear_memory() clears the loaded pipeline reference."""
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
         loader = ModelLoader()
@@ -627,19 +643,21 @@ class TestModelLoaderIntegration:
     """Integration-style tests for ModelLoader with comprehensive mocking."""
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=8 * 1024**3)
     @patch('torch.cuda.empty_cache')
     def test_full_load_and_extract_workflow(
-        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test complete workflow: load pipeline, extract UNet."""
         # Setup mock pipeline with UNet
         mock_unet = MagicMock(spec=torch.nn.Module)
         mock_pipeline = MagicMock()
         mock_pipeline.unet = mock_unet
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         # Execute workflow
         config = ModelConfig(model_id="stabilityai/sdxl-turbo")
@@ -654,16 +672,18 @@ class TestModelLoaderIntegration:
         mock_unet.eval.assert_called_once()
 
     @pytest.mark.unit
-    @patch('diffusion_trt.model_loader.DiffusionPipeline')
+    @patch('diffusion_trt.model_loader._get_diffusion_pipeline')
     @patch('torch.cuda.is_available', return_value=True)
     @patch('torch.cuda.memory_allocated', return_value=8 * 1024**3)
     @patch('torch.cuda.empty_cache')
     def test_load_both_supported_models(
-        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_pipeline_cls
+        self, mock_empty_cache, mock_mem_alloc, mock_cuda_avail, mock_get_pipeline
     ):
         """Test loading both supported models."""
         mock_pipeline = MagicMock()
+        mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
+        mock_get_pipeline.return_value = mock_pipeline_cls
         
         loader = ModelLoader()
         
