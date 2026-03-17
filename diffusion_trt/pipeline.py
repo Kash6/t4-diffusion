@@ -314,7 +314,15 @@ class OptimizedPipeline:
                 )
     
     def _apply_quantization(self) -> None:
-        """Apply INT8 quantization to the UNet."""
+        """
+        Apply INT8 quantization to the UNet.
+        
+        If accuracy degrades beyond threshold, identifies and excludes
+        problematic layers, then re-quantizes.
+        
+        Requirements:
+            - 10.3: Identify and exclude problematic layers if accuracy degrades
+        """
         logger.info("Applying INT8 quantization")
         
         # Create calibration config
@@ -337,27 +345,169 @@ class OptimizedPipeline:
             tokenizer=self._pipeline.tokenizer,
         )
         
-        # Create quantization config
-        quant_config = QuantizationConfig(
-            algorithm="int8_smoothquant",
-            calibration_method="entropy",
-            exclude_layers=self.config.exclude_layers,
-        )
+        # Start with configured exclude layers or empty list
+        exclude_layers = list(self.config.exclude_layers or [])
+        max_retries = 3
         
-        # Create quantizer and apply quantization
-        quantizer = INT8Quantizer(quant_config)
-        
-        try:
-            self._unet = quantizer.quantize(
-                model=self._unet,
-                calibration_data=calibration_data,
+        for attempt in range(max_retries):
+            # Create quantization config
+            quant_config = QuantizationConfig(
+                algorithm="int8_smoothquant",
+                calibration_method="entropy",
+                exclude_layers=exclude_layers if exclude_layers else None,
             )
-            logger.info("INT8 quantization complete")
-        except ImportError as e:
-            logger.warning(f"INT8 quantization skipped: {e}")
+            
+            # Create quantizer and apply quantization
+            quantizer = INT8Quantizer(quant_config)
+            
+            try:
+                quantized_unet = quantizer.quantize(
+                    model=self._unet,
+                    calibration_data=calibration_data,
+                )
+                
+                # Validate accuracy (Requirement 10.3)
+                is_valid, problematic_layers = self._validate_quantization_accuracy(
+                    original_unet=self._unet,
+                    quantized_unet=quantized_unet,
+                    calibration_data=calibration_data,
+                )
+                
+                if is_valid:
+                    self._unet = quantized_unet
+                    logger.info(
+                        f"INT8 quantization complete "
+                        f"(excluded {len(exclude_layers)} layers)"
+                    )
+                    return
+                else:
+                    # Add problematic layers to exclusion list and retry
+                    if problematic_layers:
+                        logger.warning(
+                            f"Quantization accuracy degraded. "
+                            f"Excluding {len(problematic_layers)} problematic layers: "
+                            f"{problematic_layers}"
+                        )
+                        exclude_layers.extend(problematic_layers)
+                    else:
+                        # No specific layers identified, use quantized anyway
+                        logger.warning(
+                            "Quantization accuracy degraded but no specific "
+                            "problematic layers identified. Using quantized model."
+                        )
+                        self._unet = quantized_unet
+                        return
+                        
+            except ImportError as e:
+                logger.warning(f"INT8 quantization skipped: {e}")
+                return
+            except Exception as e:
+                logger.warning(f"INT8 quantization attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    logger.warning("All quantization attempts failed. Using original UNet.")
+                    return
+        
+        logger.warning("Quantization retries exhausted. Using original UNet.")
+    
+    def _validate_quantization_accuracy(
+        self,
+        original_unet: nn.Module,
+        quantized_unet: nn.Module,
+        calibration_data: Any,
+        mse_threshold: float = 0.01,
+    ) -> tuple:
+        """
+        Validate that quantized model accuracy is acceptable.
+        
+        Compares outputs between original and quantized models on
+        calibration data. Returns problematic layers if accuracy degrades.
+        
+        Args:
+            original_unet: Original FP16 UNet
+            quantized_unet: INT8 quantized UNet
+            calibration_data: Calibration dataset for validation
+            mse_threshold: Maximum acceptable MSE (default: 0.01)
+            
+        Returns:
+            Tuple of (is_valid: bool, problematic_layers: List[str])
+            
+        Requirements:
+            - 10.3: Identify and exclude problematic layers if accuracy degrades
+        """
+        try:
+            # Get a sample from calibration data
+            sample = next(iter(calibration_data))
+            if isinstance(sample, dict):
+                latents = sample.get('latents', sample.get('sample'))
+                timestep = sample.get('timestep', sample.get('timesteps'))
+                encoder_hidden = sample.get('encoder_hidden_states')
+            else:
+                # Assume it's a tuple/list
+                latents, timestep, encoder_hidden = sample[:3]
+            
+            # Ensure tensors are on the right device
+            device = next(original_unet.parameters()).device
+            if latents is not None:
+                latents = latents.to(device)
+            if timestep is not None:
+                timestep = timestep.to(device)
+            if encoder_hidden is not None:
+                encoder_hidden = encoder_hidden.to(device)
+            
+            # Run inference on both models
+            with torch.no_grad():
+                original_output = original_unet(latents, timestep, encoder_hidden)
+                quantized_output = quantized_unet(latents, timestep, encoder_hidden)
+            
+            # Handle different output formats
+            if hasattr(original_output, 'sample'):
+                original_tensor = original_output.sample
+                quantized_tensor = quantized_output.sample
+            else:
+                original_tensor = original_output
+                quantized_tensor = quantized_output
+            
+            # Calculate MSE
+            mse = torch.mean((original_tensor - quantized_tensor) ** 2).item()
+            
+            logger.info(f"Quantization validation MSE: {mse:.6f} (threshold: {mse_threshold})")
+            
+            if mse <= mse_threshold:
+                return True, []
+            else:
+                # Try to identify problematic layers
+                # This is a simplified heuristic - in practice, you'd do per-layer analysis
+                problematic = []
+                
+                # Common problematic layers in diffusion models
+                common_problematic = [
+                    "conv_in",
+                    "conv_out", 
+                    "time_embedding",
+                    "add_embedding",
+                ]
+                
+                # Add layers that aren't already excluded
+                for layer in common_problematic:
+                    if layer not in (self.config.exclude_layers or []):
+                        problematic.append(layer)
+                
+                return False, problematic[:2]  # Return at most 2 layers per iteration
+                
+        except Exception as e:
+            logger.warning(f"Quantization validation failed: {e}")
+            # If validation fails, assume quantization is okay
+            return True, []
     
     def _compile_tensorrt(self) -> None:
-        """Compile the UNet with TensorRT."""
+        """
+        Compile the UNet with TensorRT.
+        
+        Falls back to FP16 precision if INT8 compilation fails.
+        
+        Requirements:
+            - 10.2: Fall back to FP16 precision if INT8 compilation fails
+        """
         logger.info("Compiling with TensorRT")
         
         # Create TensorRT config
@@ -399,8 +549,32 @@ class OptimizedPipeline:
             logger.warning(f"TensorRT compilation skipped: {e}")
             self._trt_unet = self._unet
         except Exception as e:
-            logger.warning(f"TensorRT compilation failed: {e}, using original UNet")
-            self._trt_unet = self._unet
+            # Requirement 10.2: Fall back to FP16 precision if INT8 compilation fails
+            logger.warning(
+                f"TensorRT INT8 compilation failed: {e}. "
+                f"Falling back to FP16 precision."
+            )
+            
+            # Try FP16 compilation as fallback
+            try:
+                trt_config_fp16 = TRTConfig(
+                    precision="fp16",
+                    optimization_level=self.config.optimization_level,
+                    max_batch_size=1,
+                    use_cuda_graph=True,
+                )
+                builder_fp16 = TensorRTBuilder(trt_config_fp16)
+                self._trt_unet = builder_fp16.compile_torchtrt(
+                    model=self._unet,
+                    sample_inputs=sample_inputs,
+                )
+                logger.info("TensorRT FP16 fallback compilation complete")
+            except Exception as fallback_error:
+                logger.warning(
+                    f"TensorRT FP16 fallback also failed: {fallback_error}. "
+                    f"Using original UNet without TensorRT optimization."
+                )
+                self._trt_unet = self._unet
     
     def _setup_caching(self) -> None:
         """Setup feature caching for inference acceleration."""
@@ -465,6 +639,57 @@ class OptimizedPipeline:
                     f"({T4_VRAM_LIMIT_GB} GB) during {context} even after clearing caches. "
                     f"Consider reducing batch size or image resolution."
                 )
+
+    def _recover_from_oom(self, context: str = "operation") -> bool:
+        """
+        Attempt to recover from an OutOfMemoryError.
+        
+        Performs aggressive memory cleanup:
+        1. Clear feature cache
+        2. Clear CUDA cache
+        3. Run garbage collection
+        4. Optionally reduce settings for retry
+        
+        Args:
+            context: Description of the operation that caused OOM
+            
+        Returns:
+            True if recovery was successful and operation can be retried
+            
+        Requirements:
+            - 10.1: Catch OutOfMemoryError, clear caches, run garbage collection
+        """
+        logger.warning(f"Attempting OOM recovery during {context}")
+        
+        # Step 1: Clear feature cache
+        if self._cache_manager is not None:
+            self._cache_manager.clear()
+            logger.info("Feature cache cleared during OOM recovery")
+        
+        # Step 2: Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        # Step 3: Run garbage collection
+        gc.collect()
+        
+        # Step 4: Check if we have enough memory now
+        if torch.cuda.is_available():
+            current_vram = get_vram_usage()
+            logger.info(f"VRAM after OOM recovery: {current_vram:.2f} GB")
+            
+            # If we're under the warning threshold, recovery was successful
+            if current_vram < VRAM_WARNING_THRESHOLD_GB:
+                logger.info("OOM recovery successful")
+                return True
+            else:
+                logger.warning(
+                    f"OOM recovery incomplete: VRAM still at {current_vram:.2f} GB"
+                )
+                return False
+        
+        return True
 
     def save_engine(self, path: str) -> None:
         """

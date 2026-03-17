@@ -188,6 +188,9 @@ class ModelLoader:
         """
         Load model with exponential backoff retry logic.
         
+        Implements exponential backoff up to max_retries attempts for failed downloads.
+        Logs detailed error messages with context.
+        
         Args:
             config: Model configuration
             
@@ -196,12 +199,24 @@ class ModelLoader:
             
         Raises:
             RuntimeError: If all retry attempts fail
+            
+        Requirements:
+            - 10.4: Implement exponential backoff up to 3 attempts for failed downloads
+            - 10.5: Log detailed error messages with context
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         DiffusionPipeline = _get_diffusion_pipeline()
         last_exception: Optional[Exception] = None
         
         for attempt in range(self._max_retries):
             try:
+                logger.info(
+                    f"Loading model '{config.model_id}' "
+                    f"(attempt {attempt + 1}/{self._max_retries})"
+                )
+                
                 # Build load kwargs
                 load_kwargs = {
                     "torch_dtype": config.dtype,
@@ -216,19 +231,34 @@ class ModelLoader:
                     config.model_id,
                     **load_kwargs
                 )
+                
+                logger.info(f"Model '{config.model_id}' loaded successfully")
                 return pipeline
                 
             except Exception as e:
                 last_exception = e
+                
+                # Log detailed error with context (Requirement 10.5)
+                logger.warning(
+                    f"Model download attempt {attempt + 1}/{self._max_retries} failed. "
+                    f"Model: '{config.model_id}', "
+                    f"Error type: {type(e).__name__}, "
+                    f"Error message: {str(e)}"
+                )
+                
                 if attempt < self._max_retries - 1:
-                    # Exponential backoff: 1s, 2s, 4s
+                    # Exponential backoff: 1s, 2s, 4s (Requirement 10.4)
                     wait_time = 2 ** attempt
+                    logger.info(f"Retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
         
-        raise RuntimeError(
+        # All retries exhausted - log final error and raise
+        error_msg = (
             f"Failed to load model '{config.model_id}' after {self._max_retries} attempts. "
-            f"Last error: {last_exception}"
+            f"Last error ({type(last_exception).__name__}): {last_exception}"
         )
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
     
     def extract_unet(self, pipeline) -> torch.nn.Module:
         """
