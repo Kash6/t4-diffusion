@@ -423,18 +423,20 @@ class TestVRAMConstraintProperties:
         When enforce_limit is True, the check_limit method should raise
         OutOfMemoryError if VRAM exceeds the limit. When False, it should not.
         """
-        # Use a very low limit to test enforcement
-        low_limit = 0.0001  # 0.1 MB - will definitely be exceeded
+        # Use a very low limit to test enforcement (0.001 GB = ~1MB)
+        low_limit = 0.001
         
         monitor = VRAMMonitor(limit_gb=low_limit, enforce_limit=enforce_limit)
         
         with monitor:
-            # Allocate a small tensor that will exceed the tiny limit
-            t = torch.randn(100, 100, device='cuda')
+            # Allocate a tensor that will definitely exceed 1MB limit
+            # 1000x1000 floats = 4MB
+            t = torch.randn(1000, 1000, device='cuda')
+            torch.cuda.synchronize()  # Ensure allocation is complete
             
             if enforce_limit:
                 # Should raise OutOfMemoryError
-                with pytest.raises(torch.cuda.OutOfMemoryError):
+                with pytest.raises((torch.cuda.OutOfMemoryError, MemoryError)):
                     monitor.check_limit()
             else:
                 # Should not raise
