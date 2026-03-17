@@ -67,6 +67,15 @@ from .pipeline import (
     PipelineConfig,
 )
 
+# Presets for fixed-resolution engines
+from .presets import (
+    EnginePreset,
+    PRESETS,
+    get_preset,
+    list_presets,
+    get_recommended_preset,
+)
+
 __all__ = [
     "__version__",
     # Data models
@@ -102,5 +111,11 @@ __all__ = [
     # Pipeline
     "OptimizedPipeline",
     "PipelineConfig",
+    # Presets
+    "EnginePreset",
+    "PRESETS",
+    "get_preset",
+    "list_presets",
+    "get_recommended_preset",
     # Components will be added as implemented
 ]

@@ -247,13 +247,18 @@ class OptimizedPipeline:
         
         return pipeline
     
-    def _load_model(self) -> None:
+    def _load_model(self, skip_vram_check: bool = False) -> None:
         """
         Load the diffusion model with memory optimizations.
         
         Loads the model with FP16 precision and applies memory optimizations
         (attention slicing, VAE tiling) to keep VRAM usage under control.
         Monitors VRAM to ensure model weights stay under 10GB limit.
+        
+        Args:
+            skip_vram_check: If True, skip the strict VRAM limit check.
+                Used when loading from a saved engine where we only need
+                VAE and text encoders.
         
         Raises:
             torch.cuda.OutOfMemoryError: If model weights exceed 10GB VRAM
@@ -285,6 +290,11 @@ class OptimizedPipeline:
         # Check VRAM usage after loading (Requirement 8.2)
         vram_usage = self._model_loader.get_vram_usage()
         logger.info(f"Model loaded. VRAM usage: {vram_usage:.2f} GB")
+        
+        # Skip strict check when loading from saved engine
+        if skip_vram_check:
+            logger.info("Skipping strict VRAM check (loading from saved engine)")
+            return
         
         # Verify model weights are under 10GB limit
         if vram_usage > MODEL_WEIGHTS_VRAM_LIMIT_GB:
@@ -878,7 +888,8 @@ class OptimizedPipeline:
             raise RuntimeError(f"Failed to load TensorRT engine: {e}")
         
         # Load the base diffusers pipeline for VAE, text encoder, etc.
-        pipeline._load_model()
+        # Skip strict VRAM check since we're loading from saved engine
+        pipeline._load_model(skip_vram_check=True)
         
         # Setup caching if enabled
         if config.enable_caching:
