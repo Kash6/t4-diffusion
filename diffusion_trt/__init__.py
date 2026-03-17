@@ -37,8 +37,16 @@ from .calibration import (
     DEFAULT_CALIBRATION_PROMPTS,
 )
 
+# Quantization component
+from .quantizer import (
+    INT8Quantizer,
+    QuantizationConfig,
+    QuantizationError,
+    SUPPORTED_ALGORITHMS,
+    SUPPORTED_CALIBRATION_METHODS,
+)
+
 # Core components will be imported here as they are implemented
-# from .quantizer import INT8Quantizer, QuantizationConfig
 # from .trt_builder import TensorRTBuilder, TRTConfig
 # from .cache_manager import CacheManager, CacheConfig
 # from .pipeline import OptimizedPipeline, PipelineConfig
@@ -60,5 +68,11 @@ __all__ = [
     "CalibrationEngine",
     "CalibrationConfig",
     "DEFAULT_CALIBRATION_PROMPTS",
+    # Quantization
+    "INT8Quantizer",
+    "QuantizationConfig",
+    "QuantizationError",
+    "SUPPORTED_ALGORITHMS",
+    "SUPPORTED_CALIBRATION_METHODS",
     # Components will be added as implemented
 ]
