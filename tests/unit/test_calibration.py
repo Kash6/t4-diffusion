@@ -745,14 +745,17 @@ class TestCalibrationEngineGPU:
         def forward_fn(input_ids):
             batch_size = input_ids.shape[0]
             seq_len = input_ids.shape[1]
-            mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(
+            hidden_states = torch.randn(
                 batch_size, seq_len, 768, 
                 device="cuda", dtype=torch.float16
             )
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = hidden_states
+            # Ensure .to() returns the tensor itself
+            hidden_states.to = MagicMock(return_value=hidden_states)
             return mock_output
         
-        mock_encoder.__call__ = forward_fn
+        mock_encoder.side_effect = forward_fn
         mock_tokenizer = create_mock_tokenizer()
         prompts = ["test prompt"] * 100
         
@@ -780,14 +783,15 @@ class TestCalibrationEngineGPU:
         def forward_fn(input_ids):
             batch_size = input_ids.shape[0]
             seq_len = input_ids.shape[1]
-            mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(
+            hidden_states = torch.randn(
                 batch_size, seq_len, 768, 
                 device="cuda", dtype=torch.float16
             )
+            mock_output = MagicMock()
+            mock_output.last_hidden_state = hidden_states
             return mock_output
         
-        mock_encoder.__call__ = forward_fn
+        mock_encoder.side_effect = forward_fn
         mock_tokenizer = create_mock_tokenizer()
         prompts = ["test prompt"] * 100
         
@@ -833,7 +837,7 @@ class TestCalibrationEngineTextEncoderIntegration:
             mock_output.input_ids = torch.randint(0, 1000, (batch_size, 77))
             return mock_output
         
-        mock_tokenizer.__call__ = tokenize_fn
+        mock_tokenizer.side_effect = tokenize_fn
         mock_encoder = create_mock_text_encoder()
         prompts = ["test prompt"] * 100
         
@@ -860,13 +864,12 @@ class TestCalibrationEngineTextEncoderIntegration:
             nonlocal call_count
             call_count += 1
             batch_size = input_ids.shape[0]
+            hidden_states = torch.randn(batch_size, 77, 768, dtype=torch.float16)
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(
-                batch_size, 77, 768, dtype=torch.float16
-            )
+            mock_output.last_hidden_state = hidden_states
             return mock_output
         
-        mock_encoder.__call__ = forward_fn
+        mock_encoder.side_effect = forward_fn
         prompts = ["test prompt"] * 100
         
         dataset = engine.create_dataset(prompts, mock_encoder, mock_tokenizer)
@@ -889,13 +892,12 @@ class TestCalibrationEngineTextEncoderIntegration:
         
         def forward_fn(input_ids):
             batch_size = input_ids.shape[0]
+            hidden_states = torch.randn(batch_size, 77, 768, dtype=torch.float16)
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(
-                batch_size, 77, 768, dtype=torch.float16
-            )
+            mock_output.last_hidden_state = hidden_states
             return mock_output
         
-        mock_encoder.__call__ = forward_fn
+        mock_encoder.side_effect = forward_fn
         prompts = ["test prompt"] * 100
         
         dataset = engine.create_dataset(prompts, mock_encoder, mock_tokenizer)
@@ -926,13 +928,12 @@ class TestCalibrationEngineEncoderOutputHandling:
         
         def forward_fn(input_ids):
             batch_size = input_ids.shape[0]
+            hidden_states = torch.randn(batch_size, 77, 768, dtype=torch.float16)
             mock_output = MagicMock()
-            mock_output.last_hidden_state = torch.randn(
-                batch_size, 77, 768, dtype=torch.float16
-            )
+            mock_output.last_hidden_state = hidden_states
             return mock_output
         
-        mock_encoder.__call__ = forward_fn
+        mock_encoder.side_effect = forward_fn
         prompts = ["test prompt"] * 100
         
         dataset = engine.create_dataset(prompts, mock_encoder, mock_tokenizer)
@@ -959,7 +960,7 @@ class TestCalibrationEngineEncoderOutputHandling:
             hidden_states = torch.randn(batch_size, 77, 768, dtype=torch.float16)
             return (hidden_states, None)  # Tuple format
         
-        mock_encoder.__call__ = forward_fn
+        mock_encoder.side_effect = forward_fn
         prompts = ["test prompt"] * 100
         
         dataset = engine.create_dataset(prompts, mock_encoder, mock_tokenizer)

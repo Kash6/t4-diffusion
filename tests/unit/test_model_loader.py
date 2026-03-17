@@ -290,6 +290,7 @@ class TestModelLoaderRetryLogic:
     ):
         """Test that load() retries on download failure."""
         mock_pipeline = MagicMock()
+        mock_pipeline.to.return_value = mock_pipeline  # .to() returns self
         mock_pipeline_cls = MagicMock()
         # Fail twice, then succeed
         mock_pipeline_cls.from_pretrained.side_effect = [
@@ -655,6 +656,7 @@ class TestModelLoaderIntegration:
         mock_unet = MagicMock(spec=torch.nn.Module)
         mock_pipeline = MagicMock()
         mock_pipeline.unet = mock_unet
+        mock_pipeline.to.return_value = mock_pipeline  # .to() returns self
         mock_pipeline_cls = MagicMock()
         mock_pipeline_cls.from_pretrained.return_value = mock_pipeline
         mock_get_pipeline.return_value = mock_pipeline_cls
