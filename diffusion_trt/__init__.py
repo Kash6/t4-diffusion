@@ -54,9 +54,18 @@ from .trt_builder import (
     T4_COMPUTE_CAPABILITY,
 )
 
-# Core components will be imported here as they are implemented
-# from .cache_manager import CacheManager, CacheConfig
-# from .pipeline import OptimizedPipeline, PipelineConfig
+# Cache manager component
+from .cache_manager import (
+    CacheManager,
+    CacheConfig,
+    DEFAULT_MAX_CACHE_SIZE_GB,
+)
+
+# Pipeline component
+from .pipeline import (
+    OptimizedPipeline,
+    PipelineConfig,
+)
 
 __all__ = [
     "__version__",
@@ -86,5 +95,12 @@ __all__ = [
     "TRTConfig",
     "SUPPORTED_PRECISIONS",
     "T4_COMPUTE_CAPABILITY",
+    # Cache manager
+    "CacheManager",
+    "CacheConfig",
+    "DEFAULT_MAX_CACHE_SIZE_GB",
+    # Pipeline
+    "OptimizedPipeline",
+    "PipelineConfig",
     # Components will be added as implemented
 ]
