@@ -46,8 +46,15 @@ from .quantizer import (
     SUPPORTED_CALIBRATION_METHODS,
 )
 
+# TensorRT builder component
+from .trt_builder import (
+    TensorRTBuilder,
+    TRTConfig,
+    SUPPORTED_PRECISIONS,
+    T4_COMPUTE_CAPABILITY,
+)
+
 # Core components will be imported here as they are implemented
-# from .trt_builder import TensorRTBuilder, TRTConfig
 # from .cache_manager import CacheManager, CacheConfig
 # from .pipeline import OptimizedPipeline, PipelineConfig
 
@@ -74,5 +81,10 @@ __all__ = [
     "QuantizationError",
     "SUPPORTED_ALGORITHMS",
     "SUPPORTED_CALIBRATION_METHODS",
+    # TensorRT builder
+    "TensorRTBuilder",
+    "TRTConfig",
+    "SUPPORTED_PRECISIONS",
+    "T4_COMPUTE_CAPABILITY",
     # Components will be added as implemented
 ]
