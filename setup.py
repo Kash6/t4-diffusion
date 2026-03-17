@@ -36,11 +36,9 @@ setup(
         "Topic :: Scientific/Engineering :: Image Processing",
     ],
     python_requires=">=3.10",
+    # NOTE: torch, torchvision, torch-tensorrt are pre-installed on Colab
+    # We don't include them here to avoid version conflicts
     install_requires=[
-        "torch>=2.1.0",
-        "torch-tensorrt>=2.1.0",
-        "tensorrt>=8.6",
-        "nvidia-modelopt>=0.15.0",
         "diffusers>=0.25.0",
         "transformers>=4.36.0",
         "accelerate>=0.25.0",
@@ -52,6 +50,10 @@ setup(
             "pytest>=7.0",
             "hypothesis>=6.0",
             "pytest-benchmark>=4.0",
+        ],
+        "tensorrt": [
+            # Install these manually on Colab if not present
+            "nvidia-modelopt>=0.15.0",
         ],
     },
     entry_points={

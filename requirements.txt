@@ -1,10 +1,13 @@
 # TensorRT Diffusion Model Optimization Pipeline
 # Core dependencies for NVIDIA T4 GPU optimization on Google Colab
+#
+# NOTE: On Google Colab, torch and torchvision are pre-installed.
+# Do NOT reinstall them to avoid version conflicts.
+# Install with: pip install -e . --no-deps && pip install diffusers transformers accelerate
 
-# PyTorch and TensorRT integration
-torch>=2.1.0
-torch-tensorrt>=2.1.0
-tensorrt>=8.6
+# TensorRT integration (install separately on Colab if needed)
+# torch-tensorrt>=2.1.0
+# tensorrt>=8.6
 
 # NVIDIA Model Optimizer for INT8 PTQ
 nvidia-modelopt>=0.15.0
