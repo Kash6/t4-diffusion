@@ -135,10 +135,22 @@ class TensorRTBuilder:
         # Lazy import to handle missing torch_tensorrt gracefully
         try:
             import torch_tensorrt
+            # Try to ensure the library is properly loaded
+            try:
+                torch_tensorrt.runtime.set_multi_device_safe_mode(False)
+            except Exception:
+                pass  # Ignore if this API doesn't exist
         except ImportError:
             raise ImportError(
                 "torch-tensorrt is required for TensorRT compilation. "
                 "Install with: pip install torch-tensorrt"
+            )
+        except OSError as e:
+            # Handle library loading issues
+            raise ImportError(
+                f"torch-tensorrt library failed to load: {e}. "
+                "This may be due to CUDA version mismatch. "
+                "Try: pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu128"
             )
         
         model.eval()

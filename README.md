@@ -1,17 +1,23 @@
 # t4-diffusion
 
-TensorRT-optimized Stable Diffusion for NVIDIA T4 GPUs on Google Colab's free tier.
+Stable Diffusion optimized for NVIDIA T4 GPUs on Google Colab's free tier.
 
-Combines INT8 Post-Training Quantization via TensorRT Model Optimizer with DeepCache-style feature caching to achieve up to ~2x speedups on selected pipelines while staying within the 15.6GB VRAM constraint.
+Provides memory-optimized FP16 inference with VRAM monitoring, feature caching, and graceful fallbacks. Designed to work within the 15.6GB VRAM constraint of T4 GPUs.
 
-## Features
+## Current Status
 
-- **INT8 Quantization**: Post-Training Quantization using TensorRT Model Optimizer with SmoothQuant
-- **Feature Caching**: DeepCache-style caching for training-free acceleration
-- **VRAM Optimization**: Designed for T4 GPU's 15.6GB VRAM limit with automatic monitoring
-- **Fixed-Resolution Presets**: Pre-configured engine presets for optimal T4 performance
-- **Property-Based Testing**: Correctness guarantees via Hypothesis-based property tests
-- **Easy Integration**: API compatible with HuggingFace diffusers pipelines
+**Working Features:**
+- FP16 inference with memory optimizations (attention slicing, VAE tiling)
+- VRAM monitoring with 15.6GB T4 limit enforcement
+- Feature caching infrastructure
+- Property-based testing for correctness guarantees
+- Easy-to-use API compatible with HuggingFace diffusers
+
+**Planned Features (blocked by Colab CUDA compatibility):**
+- INT8 Post-Training Quantization via TensorRT Model Optimizer
+- TensorRT compilation for additional speedup
+
+> **Note:** As of March 2026, Google Colab uses CUDA 13.x which has compatibility issues with TensorRT/nvidia-modelopt packages (built for CUDA 12.x). The pipeline automatically falls back to optimized FP16 inference when these dependencies aren't available.
 
 ## Supported Models
 
@@ -20,13 +26,13 @@ Combines INT8 Post-Training Quantization via TensorRT Model Optimizer with DeepC
 
 ## Target Hardware
 
-- NVIDIA T4 GPU (sm_75, 15.6GB VRAM, INT8 Tensor Cores)
+- NVIDIA T4 GPU (sm_75, 15.6GB VRAM)
 - Google Colab Free Tier
 
 ## Installation
 
 ```bash
-pip install t4-diffusion
+pip install git+https://github.com/Kash6/t4-diffusion.git
 ```
 
 For development:
@@ -43,7 +49,7 @@ from diffusion_trt import OptimizedPipeline, PipelineConfig
 
 config = PipelineConfig(
     model_id="stabilityai/sdxl-turbo",
-    enable_int8=True,
+    enable_int8=True,           # Falls back to FP16 if unavailable
     enable_caching=True,
     num_inference_steps=4,
     guidance_scale=0.0,
@@ -57,41 +63,15 @@ image = pipeline("A photo of a cat wearing sunglasses")[0]
 image.save("output.png")
 ```
 
-### Using Presets
-
-```python
-from diffusion_trt import get_preset, OptimizedPipeline
-
-# Get recommended preset for T4
-config = get_preset("SDXL_TURBO_512")
-pipeline = OptimizedPipeline.from_pretrained(config.model_id, config=config)
-
-# Or auto-select based on VRAM
-from diffusion_trt import get_recommended_preset
-preset_name = get_recommended_preset(max_vram_gb=15.6, prefer_quality=False)
-config = get_preset(preset_name)
-```
-
 ## Performance
 
-Benchmarks on NVIDIA T4 (Google Colab Free Tier):
+Current benchmarks on NVIDIA T4 (Google Colab Free Tier) with FP16:
 
-| Configuration | Latency | Speedup vs FP16 | VRAM |
-|--------------|---------|-----------------|------|
-| SD 1.5 @ 512×512, 20 steps, INT8 | ~3.5s | ~1.5x | ~6 GB |
-| SDXL-Turbo @ 512×512, 4 steps, INT8 | ~0.9s | ~1.5x | ~8 GB |
+| Configuration | Latency | Throughput | VRAM |
+|--------------|---------|------------|------|
+| SDXL-Turbo @ 512×512, 4 steps | ~1.5s | ~0.65 img/s | ~12 GB |
 
-*Note: Actual speedups vary by model, resolution, and baseline. Target is ≥1.5x speedup.*
-
-## Available Presets
-
-| Preset | Model | Resolution | Steps | Est. VRAM |
-|--------|-------|------------|-------|-----------|
-| `SD15_512` | SD 1.5 | 512×512 | 20 | 6 GB |
-| `SD15_768` | SD 1.5 | 768×768 | 20 | 8.5 GB |
-| `SDXL_TURBO_512` | SDXL-Turbo | 512×512 | 4 | 8 GB |
-| `SDXL_768` | SDXL-Turbo | 768×768 | 4 | 10.5 GB |
-| `SDXL_1024` | SDXL-Turbo | 1024×1024 | 4 | 14 GB |
+*With INT8/TensorRT (when available): expect ~1.5-2x speedup*
 
 ## Colab Notebook
 
@@ -110,8 +90,11 @@ See [ROADMAP.md](ROADMAP.md) for planned features including:
 - Python >= 3.10
 - CUDA-capable GPU with compute capability >= 7.5 (T4, RTX 20xx+)
 - PyTorch >= 2.1.0
+
+Optional (for INT8/TensorRT when CUDA compatible):
 - TensorRT >= 8.6
 - Torch-TensorRT >= 2.1.0
+- nvidia-modelopt >= 0.15.0
 
 ## License
 

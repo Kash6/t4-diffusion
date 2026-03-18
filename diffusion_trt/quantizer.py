@@ -27,8 +27,17 @@ logger = logging.getLogger(__name__)
 # Supported quantization algorithms
 SUPPORTED_ALGORITHMS = ["int8_smoothquant", "int8_default"]
 
-# Supported calibration methods
-SUPPORTED_CALIBRATION_METHODS = ["entropy", "minmax", "percentile"]
+# Supported calibration methods (updated for modelopt 0.15+)
+# "max" is the new name for entropy-based calibration
+SUPPORTED_CALIBRATION_METHODS = ["max", "minmax", "percentile", "entropy"]
+
+# Map old names to new names for backward compatibility
+CALIBRATION_METHOD_MAP = {
+    "entropy": "max",  # entropy is now called "max" in newer modelopt
+    "minmax": "minmax",
+    "percentile": "percentile",
+    "max": "max",
+}
 
 
 @dataclass
@@ -167,9 +176,13 @@ class INT8Quantizer:
         else:
             quant_cfg = INT8_DEFAULT_CFG.copy()
         
-        # Configure calibration method
-        quant_cfg["algorithm"] = {"method": self.config.calibration_method}
-        if self.config.calibration_method == "percentile":
+        # Configure calibration method (map old names to new)
+        calib_method = CALIBRATION_METHOD_MAP.get(
+            self.config.calibration_method, 
+            self.config.calibration_method
+        )
+        quant_cfg["algorithm"] = {"method": calib_method}
+        if calib_method == "percentile":
             quant_cfg["algorithm"]["percentile"] = self.config.percentile
         
         # Create forward loop for calibration

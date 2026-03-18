@@ -514,6 +514,7 @@ class OptimizedPipeline:
         Compile the UNet with TensorRT.
         
         Falls back to FP16 precision if INT8 compilation fails.
+        Falls back to torch.compile with inductor if TensorRT is unavailable.
         
         Requirements:
             - 10.2: Fall back to FP16 precision if INT8 compilation fails
@@ -557,7 +558,7 @@ class OptimizedPipeline:
             logger.info("TensorRT compilation complete")
         except ImportError as e:
             logger.warning(f"TensorRT compilation skipped: {e}")
-            self._trt_unet = self._unet
+            self._try_torch_compile_fallback()
         except Exception as e:
             # Requirement 10.2: Fall back to FP16 precision if INT8 compilation fails
             logger.warning(
@@ -584,7 +585,26 @@ class OptimizedPipeline:
                     f"TensorRT FP16 fallback also failed: {fallback_error}. "
                     f"Using original UNet without TensorRT optimization."
                 )
-                self._trt_unet = self._unet
+                self._try_torch_compile_fallback()
+    
+    def _try_torch_compile_fallback(self) -> None:
+        """
+        Try to optimize UNet with torch.compile as a fallback.
+        
+        Uses the inductor backend which doesn't require TensorRT.
+        Provides ~1.3-1.5x speedup on most GPUs.
+        """
+        try:
+            logger.info("Attempting torch.compile optimization (inductor backend)")
+            self._trt_unet = torch.compile(
+                self._unet,
+                mode="reduce-overhead",
+                fullgraph=False,
+            )
+            logger.info("torch.compile optimization complete")
+        except Exception as e:
+            logger.warning(f"torch.compile also failed: {e}. Using unoptimized UNet.")
+            self._trt_unet = self._unet
     
     def _setup_caching(self) -> None:
         """Setup feature caching for inference acceleration."""
