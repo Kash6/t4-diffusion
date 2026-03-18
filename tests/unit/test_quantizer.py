@@ -62,15 +62,21 @@ class TestQuantizationConfigValidConstruction:
 
     @pytest.mark.unit
     def test_valid_entropy_calibration(self):
-        """Test QuantizationConfig with entropy calibration."""
+        """Test QuantizationConfig with entropy calibration (legacy name)."""
         config = QuantizationConfig(calibration_method="entropy")
         assert config.calibration_method == "entropy"
 
     @pytest.mark.unit
-    def test_valid_minmax_calibration(self):
-        """Test QuantizationConfig with minmax calibration."""
-        config = QuantizationConfig(calibration_method="minmax")
-        assert config.calibration_method == "minmax"
+    def test_valid_max_calibration(self):
+        """Test QuantizationConfig with max calibration."""
+        config = QuantizationConfig(calibration_method="max")
+        assert config.calibration_method == "max"
+
+    @pytest.mark.unit
+    def test_valid_smoothquant_calibration(self):
+        """Test QuantizationConfig with smoothquant calibration."""
+        config = QuantizationConfig(calibration_method="smoothquant")
+        assert config.calibration_method == "smoothquant"
 
     @pytest.mark.unit
     def test_valid_percentile_calibration(self):
@@ -533,6 +539,6 @@ class TestModuleConstants:
     @pytest.mark.unit
     def test_supported_calibration_methods(self):
         """Test SUPPORTED_CALIBRATION_METHODS contains expected values."""
-        assert "entropy" in SUPPORTED_CALIBRATION_METHODS
-        assert "minmax" in SUPPORTED_CALIBRATION_METHODS
+        assert "max" in SUPPORTED_CALIBRATION_METHODS
+        assert "smoothquant" in SUPPORTED_CALIBRATION_METHODS
         assert "percentile" in SUPPORTED_CALIBRATION_METHODS

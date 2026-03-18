@@ -10,6 +10,10 @@ Requirements covered:
 - 3.3: Support excluding specified layers from quantization (keep in FP16)
 - 3.4: Ensure MSE between original and quantized outputs is below 0.01
 - 3.5: Log problematic layers if quantization error exceeds threshold
+
+Compatibility:
+- nvidia-modelopt >= 0.39.0 for CUDA 13.x (Google Colab March 2026+)
+- nvidia-modelopt >= 0.15.0 for CUDA 12.x
 """
 
 from dataclasses import dataclass, field
@@ -27,16 +31,17 @@ logger = logging.getLogger(__name__)
 # Supported quantization algorithms
 SUPPORTED_ALGORITHMS = ["int8_smoothquant", "int8_default"]
 
-# Supported calibration methods (updated for modelopt 0.15+)
-# "max" is the new name for entropy-based calibration
-SUPPORTED_CALIBRATION_METHODS = ["max", "minmax", "percentile", "entropy"]
+# Supported calibration methods
+# modelopt 0.39+ uses "max" for max-based calibration (recommended for diffusion)
+SUPPORTED_CALIBRATION_METHODS = ["max", "smoothquant", "percentile"]
 
 # Map old names to new names for backward compatibility
 CALIBRATION_METHOD_MAP = {
-    "entropy": "max",  # entropy is now called "max" in newer modelopt
-    "minmax": "minmax",
+    "entropy": "max",      # legacy name -> max calibration
+    "minmax": "max",       # legacy name -> max calibration  
     "percentile": "percentile",
     "max": "max",
+    "smoothquant": "smoothquant",
 }
 
 
@@ -47,14 +52,14 @@ class QuantizationConfig:
     
     Attributes:
         algorithm: Quantization algorithm ("int8_smoothquant" or "int8_default")
-        calibration_method: Calibration method ("entropy", "minmax", "percentile")
+        calibration_method: Calibration method ("max", "smoothquant", "percentile", or legacy "entropy")
         percentile: Percentile for percentile calibration (default 99.99)
         exclude_layers: List of layer name patterns to keep in FP16
         max_quantization_error: Maximum allowed MSE between original and quantized
         num_calibration_batches: Number of batches to use for calibration
     """
     algorithm: str = "int8_smoothquant"
-    calibration_method: str = "entropy"
+    calibration_method: str = "entropy"  # Legacy default, maps to "max"
     percentile: float = 99.99
     exclude_layers: Optional[List[str]] = None
     max_quantization_error: float = MAX_QUANTIZATION_ERROR
@@ -68,7 +73,9 @@ class QuantizationConfig:
                 f"Supported: {SUPPORTED_ALGORITHMS}"
             )
         
-        if self.calibration_method not in SUPPORTED_CALIBRATION_METHODS:
+        # Accept both new and legacy calibration method names
+        valid_methods = list(SUPPORTED_CALIBRATION_METHODS) + list(CALIBRATION_METHOD_MAP.keys())
+        if self.calibration_method not in valid_methods:
             raise ValueError(
                 f"Unsupported calibration method: '{self.calibration_method}'. "
                 f"Supported: {SUPPORTED_CALIBRATION_METHODS}"
@@ -147,7 +154,7 @@ class INT8Quantizer:
         
         Args:
             model: PyTorch model to quantize (typically UNet)
-            calibration_data: Iterator of calibration batches
+            calibration_data: Iterator or list of calibration batches
             forward_fn: Optional custom forward function for calibration
             
         Returns:
@@ -161,10 +168,13 @@ class INT8Quantizer:
         try:
             import modelopt.torch.quantization as mtq
             from modelopt.torch.quantization import INT8_SMOOTHQUANT_CFG, INT8_DEFAULT_CFG
+            # Import calibration functions for modelopt 0.39+
+            from modelopt.torch.quantization.model_calib import max_calibrate, smoothquant
         except ImportError:
             raise ImportError(
                 "nvidia-modelopt is required for INT8 quantization. "
-                "Install with: pip install nvidia-modelopt"
+                "For CUDA 13.x (Colab): pip install nvidia-modelopt>=0.39.0\n"
+                "For CUDA 12.x: pip install nvidia-modelopt>=0.15.0"
             )
         
         # Set model to eval mode
@@ -176,38 +186,47 @@ class INT8Quantizer:
         else:
             quant_cfg = INT8_DEFAULT_CFG.copy()
         
-        # Configure calibration method (map old names to new)
-        calib_method = CALIBRATION_METHOD_MAP.get(
-            self.config.calibration_method, 
-            self.config.calibration_method
-        )
-        quant_cfg["algorithm"] = {"method": calib_method}
-        if calib_method == "percentile":
-            quant_cfg["algorithm"]["percentile"] = self.config.percentile
-        
         # Create forward loop for calibration
         if forward_fn is None:
             forward_fn = self._default_forward_fn
         
+        # Convert to list if it's an iterator (so we can iterate multiple times)
+        if not isinstance(calibration_data, list):
+            calibration_data = list(calibration_data)
+        
+        # Store for use in calibration loop
+        self._calibration_data_list = calibration_data
+        self._forward_fn = forward_fn
+        
         def calibration_loop(model):
             """Run calibration data through the model."""
             batch_count = 0
-            for batch in calibration_data:
+            for batch in self._calibration_data_list:
                 if batch_count >= self.config.num_calibration_batches:
                     break
-                forward_fn(model, batch)
+                self._forward_fn(model, batch)
                 batch_count += 1
         
-        # Apply quantization with layer exclusion
-        exclude_filter = self._create_exclude_filter()
-        
         logger.info(f"Applying INT8 quantization with {self.config.algorithm}")
+        logger.info(f"Calibration data: {len(calibration_data)} batches")
         
-        quantized_model = mtq.quantize(
-            model,
-            quant_cfg,
-            forward_loop=calibration_loop,
+        # First, insert quantizers into the model
+        quantized_model = mtq.quantize(model, quant_cfg)
+        
+        # Then calibrate using the appropriate method (modelopt 0.39+ API)
+        calib_method = CALIBRATION_METHOD_MAP.get(
+            self.config.calibration_method, 
+            self.config.calibration_method
         )
+        
+        logger.info(f"Running calibration with method: {calib_method}")
+        
+        if calib_method == "smoothquant" or self.config.algorithm == "int8_smoothquant":
+            # Use SmoothQuant calibration (recommended for diffusion models)
+            smoothquant(quantized_model, forward_loop=calibration_loop, alpha=0.8)
+        else:
+            # Use max calibration (default)
+            max_calibrate(quantized_model, forward_loop=calibration_loop)
         
         # Apply exclusions by converting specified layers back to FP16
         if self.config.exclude_layers:

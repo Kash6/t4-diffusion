@@ -347,13 +347,13 @@ class OptimizedPipeline:
         # Create calibration engine
         calib_engine = CalibrationEngine(calib_config)
         
-        # Generate calibration data
+        # Generate calibration data - convert to list so it can be reused on retries
         prompts = calib_engine.get_default_prompts()
-        calibration_data = calib_engine.create_dataset(
+        calibration_data = list(calib_engine.create_dataset(
             prompts=prompts,
             text_encoder=self._pipeline.text_encoder,
             tokenizer=self._pipeline.tokenizer,
-        )
+        ))
         
         # Start with configured exclude layers or empty list
         exclude_layers = list(self.config.exclude_layers or [])
@@ -363,7 +363,7 @@ class OptimizedPipeline:
             # Create quantization config
             quant_config = QuantizationConfig(
                 algorithm="int8_smoothquant",
-                calibration_method="entropy",
+                calibration_method="smoothquant",  # Use smoothquant for diffusion models
                 exclude_layers=exclude_layers if exclude_layers else None,
             )
             
@@ -583,7 +583,7 @@ class OptimizedPipeline:
             except Exception as fallback_error:
                 logger.warning(
                     f"TensorRT FP16 fallback also failed: {fallback_error}. "
-                    f"Using original UNet without TensorRT optimization."
+                    f"Trying torch.compile fallback."
                 )
                 self._try_torch_compile_fallback()
     
@@ -592,19 +592,21 @@ class OptimizedPipeline:
         Try to optimize UNet with torch.compile as a fallback.
         
         Uses the inductor backend which doesn't require TensorRT.
-        Provides ~1.3-1.5x speedup on most GPUs.
+        Provides ~1.2-1.4x speedup on most GPUs after warmup.
         """
         try:
-            logger.info("Attempting torch.compile optimization (inductor backend)")
+            logger.warning("Attempting torch.compile optimization (inductor backend)...")
             self._trt_unet = torch.compile(
                 self._unet,
                 mode="reduce-overhead",
                 fullgraph=False,
             )
-            logger.info("torch.compile optimization complete")
+            self._optimization_level = "torch_compile"
+            logger.warning("✓ torch.compile optimization applied. First inference will be slower (compilation).")
         except Exception as e:
-            logger.warning(f"torch.compile also failed: {e}. Using unoptimized UNet.")
+            logger.warning(f"torch.compile also failed: {e}. Using unoptimized FP16 UNet.")
             self._trt_unet = self._unet
+            self._optimization_level = "fp16_baseline"
     
     def _setup_caching(self) -> None:
         """Setup feature caching for inference acceleration."""

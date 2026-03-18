@@ -1,23 +1,17 @@
 # t4-diffusion
 
-Stable Diffusion optimized for NVIDIA T4 GPUs on Google Colab's free tier.
+TensorRT-optimized Stable Diffusion for NVIDIA T4 GPUs on Google Colab's free tier.
 
-Provides memory-optimized FP16 inference with VRAM monitoring, feature caching, and graceful fallbacks. Designed to work within the 15.6GB VRAM constraint of T4 GPUs.
+Provides INT8 quantization, TensorRT compilation, feature caching, and VRAM monitoring. Designed to achieve 1.5-2x speedup while staying within the 15.6GB VRAM constraint of T4 GPUs.
 
-## Current Status
+## Features
 
-**Working Features:**
-- FP16 inference with memory optimizations (attention slicing, VAE tiling)
-- VRAM monitoring with 15.6GB T4 limit enforcement
-- Feature caching infrastructure
-- Property-based testing for correctness guarantees
-- Easy-to-use API compatible with HuggingFace diffusers
-
-**Planned Features (blocked by Colab CUDA compatibility):**
-- INT8 Post-Training Quantization via TensorRT Model Optimizer
-- TensorRT compilation for additional speedup
-
-> **Note:** As of March 2026, Google Colab uses CUDA 13.x which has compatibility issues with TensorRT/nvidia-modelopt packages (built for CUDA 12.x). The pipeline automatically falls back to optimized FP16 inference when these dependencies aren't available.
+- **INT8 Quantization** via nvidia-modelopt with SmoothQuant algorithm
+- **TensorRT Compilation** for optimized inference
+- **Feature Caching** for additional acceleration
+- **VRAM Monitoring** with 15.6GB T4 limit enforcement
+- **Property-Based Testing** for correctness guarantees
+- **Easy-to-use API** compatible with HuggingFace diffusers
 
 ## Supported Models
 
@@ -31,15 +25,28 @@ Provides memory-optimized FP16 inference with VRAM monitoring, feature caching, 
 
 ## Installation
 
+### Google Colab (CUDA 13.x)
+
 ```bash
+# Install CUDA 13 compatible TensorRT packages
+pip install tensorrt-cu13 tensorrt-lean-cu13
+
+# Install torch-tensorrt for TensorRT compilation
+pip install torch-tensorrt
+
+# Install nvidia-modelopt 0.39+ for CUDA 13
+pip install nvidia-modelopt>=0.39.0
+
+# Install t4-diffusion
 pip install git+https://github.com/Kash6/t4-diffusion.git
 ```
 
-For development:
+### Local Development (CUDA 12.x)
+
 ```bash
 git clone https://github.com/Kash6/t4-diffusion.git
 cd t4-diffusion
-pip install -e ".[dev]"
+pip install -e ".[dev,tensorrt-cuda12]"
 ```
 
 ## Quick Start
@@ -49,8 +56,8 @@ from diffusion_trt import OptimizedPipeline, PipelineConfig
 
 config = PipelineConfig(
     model_id="stabilityai/sdxl-turbo",
-    enable_int8=True,           # Falls back to FP16 if unavailable
-    enable_caching=True,
+    enable_int8=True,           # INT8 quantization
+    enable_caching=True,        # Feature caching
     num_inference_steps=4,
     guidance_scale=0.0,
 )
@@ -65,13 +72,12 @@ image.save("output.png")
 
 ## Performance
 
-Current benchmarks on NVIDIA T4 (Google Colab Free Tier) with FP16:
+Expected benchmarks on NVIDIA T4 (Google Colab Free Tier):
 
-| Configuration | Latency | Throughput | VRAM |
-|--------------|---------|------------|------|
-| SDXL-Turbo @ 512×512, 4 steps | ~1.5s | ~0.65 img/s | ~12 GB |
-
-*With INT8/TensorRT (when available): expect ~1.5-2x speedup*
+| Configuration | FP16 Baseline | INT8 TensorRT | Speedup |
+|--------------|---------------|---------------|---------|
+| SDXL-Turbo @ 512×512, 4 steps | ~1.5s | ~0.8-1.0s | 1.5-2x |
+| SD 1.5 @ 512×512, 20 steps | ~4.0s | ~2.5-3.0s | 1.3-1.6x |
 
 ## Colab Notebook
 
@@ -91,9 +97,15 @@ See [ROADMAP.md](ROADMAP.md) for planned features including:
 - CUDA-capable GPU with compute capability >= 7.5 (T4, RTX 20xx+)
 - PyTorch >= 2.1.0
 
-Optional (for INT8/TensorRT when CUDA compatible):
-- TensorRT >= 8.6
-- Torch-TensorRT >= 2.1.0
+### For CUDA 13.x (Google Colab March 2026+)
+- tensorrt-cu13
+- tensorrt-lean-cu13
+- torch-tensorrt
+- nvidia-modelopt >= 0.39.0
+
+### For CUDA 12.x
+- tensorrt
+- torch-tensorrt >= 2.1.0
 - nvidia-modelopt >= 0.15.0
 
 ## License

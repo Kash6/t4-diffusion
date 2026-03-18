@@ -52,8 +52,12 @@ setup(
             "pytest-benchmark>=4.0",
         ],
         "tensorrt": [
-            # Install these manually on Colab if not present
-            "nvidia-modelopt>=0.15.0",
+            # For CUDA 13.x (Google Colab March 2026+)
+            "nvidia-modelopt>=0.39.0",
+        ],
+        "tensorrt-cuda12": [
+            # For CUDA 12.x environments
+            "nvidia-modelopt>=0.15.0,<0.39.0",
         ],
     },
     entry_points={
