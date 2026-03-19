@@ -175,6 +175,13 @@ class INT8Quantizer:
                 "For CUDA 12.x: pip install nvidia-modelopt>=0.15.0"
             )
         
+        # Try to use modelopt's built-in diffusion forward function
+        try:
+            from modelopt.torch.export.diffusers_utils import generate_diffusion_dummy_forward_fn
+            use_modelopt_forward = True
+        except ImportError:
+            use_modelopt_forward = False
+        
         # Set model to eval mode
         model.eval()
         
@@ -185,28 +192,61 @@ class INT8Quantizer:
             quant_cfg = INT8_DEFAULT_CFG.copy()
         
         # Create forward loop for calibration
-        if forward_fn is None:
-            forward_fn = self._default_forward_fn
-        
-        # Convert to list if it's an iterator (so we can iterate multiple times)
-        if not isinstance(calibration_data, list):
-            calibration_data = list(calibration_data)
-        
-        # Store for use in calibration loop
-        self._calibration_data_list = calibration_data
-        self._forward_fn = forward_fn
-        
-        def calibration_loop(model):
-            """Run calibration data through the model."""
-            batch_count = 0
-            for batch in self._calibration_data_list:
-                if batch_count >= self.config.num_calibration_batches:
-                    break
-                self._forward_fn(model, batch)
-                batch_count += 1
+        if use_modelopt_forward:
+            # Use modelopt's built-in forward function for diffusion models
+            # generate_diffusion_dummy_forward_fn returns a callable that performs
+            # num_iterations forward passes with dummy inputs
+            logger.info("Using modelopt's diffusion forward function for calibration")
+            
+            # Get latent dimensions from model config
+            config = getattr(model, "config", {})
+            if hasattr(config, "to_dict"):
+                config = config.to_dict()
+            elif not isinstance(config, dict):
+                config = {}
+            
+            # Default to 64x64 latent (512x512 image / 8)
+            latent_height = 64
+            latent_width = 64
+            
+            # Create the forward function with appropriate iterations
+            # The forward_loop parameter in mtq.quantize expects a callable that
+            # takes the model as argument: forward_loop(model)
+            dummy_forward_fn = generate_diffusion_dummy_forward_fn(
+                model=model,
+                batch_size=2,
+                height=latent_height,
+                width=latent_width,
+                num_iterations=min(self.config.num_calibration_batches, 10),
+            )
+            
+            def calibration_loop(model_arg):
+                """Run calibration using modelopt's dummy forward."""
+                # dummy_forward_fn already has the model bound, just call it
+                dummy_forward_fn()
+        else:
+            # Fall back to custom forward function
+            if forward_fn is None:
+                forward_fn = self._default_forward_fn
+            
+            # Convert to list if it's an iterator (so we can iterate multiple times)
+            if not isinstance(calibration_data, list):
+                calibration_data = list(calibration_data)
+            
+            # Store for use in calibration loop
+            self._calibration_data_list = calibration_data
+            self._forward_fn = forward_fn
+            
+            def calibration_loop(model_arg):
+                """Run calibration data through the model."""
+                batch_count = 0
+                for batch in self._calibration_data_list:
+                    if batch_count >= self.config.num_calibration_batches:
+                        break
+                    self._forward_fn(model_arg, batch)
+                    batch_count += 1
         
         logger.info(f"Applying INT8 quantization with {self.config.algorithm}")
-        logger.info(f"Calibration data: {len(calibration_data)} batches")
         
         # Apply quantization with calibration in one step (modelopt API)
         # The forward_loop is passed to mtq.quantize for calibration
