@@ -355,11 +355,22 @@ class OptimizedPipeline:
             tokenizer=self._pipeline.tokenizer,
         ))
         
+        logger.info(f"Generated {len(calibration_data)} calibration batches")
+        
+        # Store original UNet for retry attempts (quantization modifies the model in-place)
+        import copy
+        original_unet_state = copy.deepcopy(self._unet.state_dict())
+        
         # Start with configured exclude layers or empty list
         exclude_layers = list(self.config.exclude_layers or [])
         max_retries = 3
         
         for attempt in range(max_retries):
+            # Restore original UNet state for retry attempts
+            if attempt > 0:
+                logger.info(f"Restoring original UNet for retry attempt {attempt + 1}")
+                self._unet.load_state_dict(original_unet_state)
+            
             # Create quantization config
             quant_config = QuantizationConfig(
                 algorithm="int8_smoothquant",

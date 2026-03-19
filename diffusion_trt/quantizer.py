@@ -229,11 +229,44 @@ class INT8Quantizer:
     ) -> torch.Tensor:
         """Default forward function for UNet calibration."""
         with torch.no_grad():
-            return model(
-                batch["sample"],
-                batch["timestep"],
-                encoder_hidden_states=batch["encoder_hidden_states"],
+            # Check if this is an SDXL model (has add_embedding)
+            is_sdxl = (
+                hasattr(model, 'config') and 
+                hasattr(model.config, 'addition_embed_type') and 
+                model.config.addition_embed_type == "text_time"
             )
+            
+            if is_sdxl:
+                # SDXL requires additional conditioning
+                # Create dummy added_cond_kwargs for SDXL
+                batch_size = batch["sample"].shape[0]
+                device = batch["sample"].device
+                dtype = batch["sample"].dtype
+                
+                # SDXL uses text_embeds (pooled) and time_ids
+                # text_embeds: [batch, 1280] - pooled text embedding
+                # time_ids: [batch, 6] - original_size, crops_coords_top_left, target_size
+                text_embeds = torch.zeros(batch_size, 1280, device=device, dtype=dtype)
+                time_ids = torch.zeros(batch_size, 6, device=device, dtype=dtype)
+                
+                added_cond_kwargs = {
+                    "text_embeds": text_embeds,
+                    "time_ids": time_ids,
+                }
+                
+                return model(
+                    batch["sample"],
+                    batch["timestep"],
+                    encoder_hidden_states=batch["encoder_hidden_states"],
+                    added_cond_kwargs=added_cond_kwargs,
+                )
+            else:
+                # Standard SD 1.5 / SD 2.x forward
+                return model(
+                    batch["sample"],
+                    batch["timestep"],
+                    encoder_hidden_states=batch["encoder_hidden_states"],
+                )
     
     def _create_exclude_filter(self) -> Optional[Callable]:
         """Create a filter function for layer exclusion."""
