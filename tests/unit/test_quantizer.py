@@ -364,7 +364,7 @@ class TestINT8QuantizerLayerExclusion:
     @pytest.mark.unit
     def test_exclude_filter_none_when_no_exclusions(self):
         """Test that exclude filter is None when no exclusions specified."""
-        config = QuantizationConfig(exclude_layers=None)
+        config = QuantizationConfig(exclude_layers=None, use_diffusion_exclusions=False)
         quantizer = INT8Quantizer(config)
         
         filter_fn = quantizer._create_exclude_filter()

@@ -14,6 +14,9 @@ Requirements covered:
 Compatibility:
 - nvidia-modelopt >= 0.39.0 for CUDA 13.x (Google Colab March 2026+)
 - nvidia-modelopt >= 0.15.0 for CUDA 12.x
+
+Based on NVIDIA's TensorRT demo for SDXL INT8 quantization:
+https://github.com/NVIDIA/TensorRT/tree/main/demo/Diffusion
 """
 
 from dataclasses import dataclass, field
@@ -44,6 +47,19 @@ CALIBRATION_METHOD_MAP = {
     "smoothquant": "smoothquant",
 }
 
+# Layers to exclude from quantization for diffusion models
+# Based on NVIDIA's TensorRT demo - these layers cause accuracy issues when quantized
+DIFFUSION_EXCLUDE_PATTERNS = [
+    "time_emb_proj",      # Time embedding projection
+    "time_embedding",     # Time embedding layers
+    "conv_in",            # Input convolution
+    "conv_out",           # Output convolution
+    "conv_shortcut",      # Skip connection convolutions
+    "add_embedding",      # SDXL additional embeddings
+    "proj_in",            # Attention input projections (optional, for better accuracy)
+    "proj_out",           # Attention output projections (optional, for better accuracy)
+]
+
 
 @dataclass
 class QuantizationConfig:
@@ -55,6 +71,7 @@ class QuantizationConfig:
         calibration_method: Calibration method ("max", "smoothquant", "percentile", or legacy "entropy")
         percentile: Percentile for percentile calibration (default 99.99)
         exclude_layers: List of layer name patterns to keep in FP16
+        use_diffusion_exclusions: Auto-exclude problematic layers for diffusion models
         max_quantization_error: Maximum allowed MSE between original and quantized
         num_calibration_batches: Number of batches to use for calibration
     """
@@ -62,6 +79,7 @@ class QuantizationConfig:
     calibration_method: str = "entropy"  # Legacy default, maps to "max"
     percentile: float = 99.99
     exclude_layers: Optional[List[str]] = None
+    use_diffusion_exclusions: bool = True  # Auto-exclude problematic layers
     max_quantization_error: float = MAX_QUANTIZATION_ERROR
     num_calibration_batches: int = 100
     
@@ -95,6 +113,15 @@ class QuantizationConfig:
             raise ValueError(
                 f"num_calibration_batches must be at least 1, got {self.num_calibration_batches}"
             )
+    
+    def get_effective_exclude_layers(self) -> List[str]:
+        """Get the combined list of layers to exclude from quantization."""
+        exclude = list(self.exclude_layers or [])
+        if self.use_diffusion_exclusions:
+            for pattern in DIFFUSION_EXCLUDE_PATTERNS:
+                if pattern not in exclude:
+                    exclude.append(pattern)
+        return exclude
 
 
 class QuantizationError(Exception):
@@ -167,7 +194,6 @@ class INT8Quantizer:
         # Lazy import to handle missing modelopt gracefully
         try:
             import modelopt.torch.quantization as mtq
-            from modelopt.torch.quantization import INT8_SMOOTHQUANT_CFG, INT8_DEFAULT_CFG
         except ImportError:
             raise ImportError(
                 "nvidia-modelopt is required for INT8 quantization. "
@@ -175,92 +201,142 @@ class INT8Quantizer:
                 "For CUDA 12.x: pip install nvidia-modelopt>=0.15.0"
             )
         
-        # Try to use modelopt's built-in diffusion forward function
-        try:
-            from modelopt.torch.export.diffusers_utils import generate_diffusion_dummy_forward_fn
-            use_modelopt_forward = True
-        except ImportError:
-            use_modelopt_forward = False
-        
         # Set model to eval mode
         model.eval()
         
-        # Select quantization config based on algorithm
-        if self.config.algorithm == "int8_smoothquant":
-            quant_cfg = INT8_SMOOTHQUANT_CFG.copy()
-        else:
-            quant_cfg = INT8_DEFAULT_CFG.copy()
+        # Get effective exclude layers (including diffusion-specific exclusions)
+        exclude_layers = self.config.get_effective_exclude_layers()
+        logger.info(f"Layers to exclude from quantization: {exclude_layers}")
         
-        # Create forward loop for calibration
-        if use_modelopt_forward:
-            # Use modelopt's built-in forward function for diffusion models
-            # generate_diffusion_dummy_forward_fn returns a callable that performs
-            # num_iterations forward passes with dummy inputs
-            logger.info("Using modelopt's diffusion forward function for calibration")
-            
-            # Get latent dimensions from model config
-            config = getattr(model, "config", {})
-            if hasattr(config, "to_dict"):
-                config = config.to_dict()
-            elif not isinstance(config, dict):
-                config = {}
-            
-            # Default to 64x64 latent (512x512 image / 8)
-            latent_height = 64
-            latent_width = 64
-            
-            # Create the forward function with appropriate iterations
-            # The forward_loop parameter in mtq.quantize expects a callable that
-            # takes the model as argument: forward_loop(model)
-            dummy_forward_fn = generate_diffusion_dummy_forward_fn(
-                model=model,
-                batch_size=2,
-                height=latent_height,
-                width=latent_width,
-                num_iterations=min(self.config.num_calibration_batches, 10),
-            )
-            
-            def calibration_loop(model_arg):
-                """Run calibration using modelopt's dummy forward."""
-                # dummy_forward_fn already has the model bound, just call it
-                dummy_forward_fn()
-        else:
-            # Fall back to custom forward function
-            if forward_fn is None:
-                forward_fn = self._default_forward_fn
-            
-            # Convert to list if it's an iterator (so we can iterate multiple times)
-            if not isinstance(calibration_data, list):
-                calibration_data = list(calibration_data)
-            
-            # Store for use in calibration loop
-            self._calibration_data_list = calibration_data
-            self._forward_fn = forward_fn
-            
-            def calibration_loop(model_arg):
-                """Run calibration data through the model."""
-                batch_count = 0
-                for batch in self._calibration_data_list:
-                    if batch_count >= self.config.num_calibration_batches:
-                        break
+        # Create custom quantization config with filter function
+        # This is based on NVIDIA's TensorRT demo approach
+        quant_cfg = self._create_diffusion_quant_config(exclude_layers)
+        
+        # Fall back to custom forward function
+        if forward_fn is None:
+            forward_fn = self._default_forward_fn
+        
+        # Convert to list if it's an iterator (so we can iterate multiple times)
+        if not isinstance(calibration_data, list):
+            calibration_data = list(calibration_data)
+        
+        if len(calibration_data) == 0:
+            raise ValueError("Calibration data is empty")
+        
+        # Store for use in calibration loop
+        self._calibration_data_list = calibration_data
+        self._forward_fn = forward_fn
+        
+        def calibration_loop(model_arg):
+            """Run calibration data through the model."""
+            batch_count = 0
+            for batch in self._calibration_data_list:
+                if batch_count >= self.config.num_calibration_batches:
+                    break
+                try:
                     self._forward_fn(model_arg, batch)
-                    batch_count += 1
+                except Exception as e:
+                    logger.warning(f"Calibration batch {batch_count} failed: {e}")
+                    # Continue with next batch instead of failing completely
+                    continue
+                batch_count += 1
+            
+            if batch_count == 0:
+                raise RuntimeError("All calibration batches failed")
+            
+            logger.info(f"Calibration completed with {batch_count} batches")
         
         logger.info(f"Applying INT8 quantization with {self.config.algorithm}")
         
         # Apply quantization with calibration in one step (modelopt API)
         # The forward_loop is passed to mtq.quantize for calibration
-        quantized_model = mtq.quantize(model, quant_cfg, forward_loop=calibration_loop)
-        
-        # Apply exclusions by converting specified layers back to FP16
-        if self.config.exclude_layers:
-            self._apply_layer_exclusions(quantized_model)
+        try:
+            quantized_model = mtq.quantize(model, quant_cfg, forward_loop=calibration_loop)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"mtq.quantize failed: {error_msg}")
+            
+            # Check for common errors and provide helpful messages
+            if "NoneType" in error_msg:
+                logger.error(
+                    "NoneType error during quantization. This may be caused by:\n"
+                    "1. Incompatible model architecture\n"
+                    "2. Missing required model attributes\n"
+                    "3. Calibration data format issues"
+                )
+            
+            raise
         
         self._quantized_model = quantized_model
         
         logger.info("INT8 quantization complete")
         
         return quantized_model
+    
+    def _create_diffusion_quant_config(self, exclude_layers: List[str]) -> Dict:
+        """
+        Create a custom quantization config for diffusion models.
+        
+        Based on NVIDIA's TensorRT demo approach which uses a filter function
+        to exclude problematic layers from quantization.
+        
+        Args:
+            exclude_layers: List of layer name patterns to exclude
+            
+        Returns:
+            Quantization config dictionary for mtq.quantize
+        """
+        try:
+            import modelopt.torch.quantization as mtq
+            from modelopt.torch.quantization import INT8_SMOOTHQUANT_CFG, INT8_DEFAULT_CFG
+        except ImportError:
+            raise ImportError("nvidia-modelopt is required")
+        
+        # Start with the base config
+        if self.config.algorithm == "int8_smoothquant":
+            base_cfg = INT8_SMOOTHQUANT_CFG.copy()
+        else:
+            base_cfg = INT8_DEFAULT_CFG.copy()
+        
+        # Create filter function to exclude specified layers
+        def filter_func(name: str) -> bool:
+            """
+            Filter function for layer quantization.
+            
+            Returns True if the layer should be quantized, False to skip.
+            """
+            if name is None:
+                return False
+            
+            # Check if any exclude pattern matches
+            for pattern in exclude_layers:
+                if pattern in name:
+                    logger.debug(f"Excluding layer from quantization: {name}")
+                    return False
+            
+            return True
+        
+        # Add filter function to config
+        # The filter_func is used by modelopt to decide which layers to quantize
+        quant_cfg = base_cfg.copy()
+        
+        # Try to set the filter function - API may vary by modelopt version
+        try:
+            # modelopt 0.39+ API
+            quant_cfg["quant_cfg"]["*"]["filter_func"] = filter_func
+        except (KeyError, TypeError):
+            try:
+                # Alternative API structure
+                if "quant_cfg" not in quant_cfg:
+                    quant_cfg["quant_cfg"] = {}
+                if "*" not in quant_cfg["quant_cfg"]:
+                    quant_cfg["quant_cfg"]["*"] = {}
+                quant_cfg["quant_cfg"]["*"]["filter_func"] = filter_func
+            except Exception as e:
+                logger.warning(f"Could not set filter_func in quant config: {e}")
+                # Fall back to post-quantization exclusion
+        
+        return quant_cfg
     
     def _default_forward_fn(
         self,
@@ -269,25 +345,83 @@ class INT8Quantizer:
     ) -> torch.Tensor:
         """Default forward function for UNet calibration."""
         with torch.no_grad():
+            # Get batch tensors with fallback keys
+            sample = batch.get("sample", batch.get("latents"))
+            timestep = batch.get("timestep", batch.get("timesteps"))
+            encoder_hidden_states = batch.get("encoder_hidden_states")
+            
+            if sample is None:
+                raise ValueError(
+                    f"Calibration batch missing 'sample' or 'latents'. "
+                    f"Got keys: {list(batch.keys())}"
+                )
+            
+            if timestep is None:
+                raise ValueError(
+                    f"Calibration batch missing 'timestep' or 'timesteps'. "
+                    f"Got keys: {list(batch.keys())}"
+                )
+            
+            if encoder_hidden_states is None:
+                raise ValueError(
+                    f"Calibration batch missing 'encoder_hidden_states'. "
+                    f"Got keys: {list(batch.keys())}"
+                )
+            
+            # Try to get device and dtype from model parameters
+            # Fall back to sample's device/dtype if model is a mock or has no parameters
+            try:
+                model_param = next(model.parameters())
+                device = model_param.device
+                dtype = model_param.dtype
+            except (StopIteration, AttributeError):
+                # Model has no parameters or is a mock - use sample's device/dtype
+                device = sample.device
+                dtype = sample.dtype
+            
+            # Only convert if device/dtype are valid torch types
+            if isinstance(device, torch.device) and isinstance(dtype, torch.dtype):
+                sample = sample.to(device=device, dtype=dtype)
+                encoder_hidden_states = encoder_hidden_states.to(device=device, dtype=dtype)
+            
+            # Handle timestep - should be long tensor
+            if hasattr(timestep, 'dtype') and timestep.dtype != torch.long:
+                timestep = timestep.long()
+            if isinstance(device, torch.device):
+                timestep = timestep.to(device=device)
+            
             # Check if this is an SDXL model (has add_embedding)
-            is_sdxl = (
-                hasattr(model, 'config') and 
-                hasattr(model.config, 'addition_embed_type') and 
-                model.config.addition_embed_type == "text_time"
-            )
+            model_config = getattr(model, 'config', None)
+            is_sdxl = False
+            if model_config is not None:
+                addition_embed_type = getattr(model_config, 'addition_embed_type', None)
+                is_sdxl = addition_embed_type == "text_time"
             
             if is_sdxl:
                 # SDXL requires additional conditioning
-                # Create dummy added_cond_kwargs for SDXL
-                batch_size = batch["sample"].shape[0]
-                device = batch["sample"].device
-                dtype = batch["sample"].dtype
+                batch_size = sample.shape[0]
                 
                 # SDXL uses text_embeds (pooled) and time_ids
                 # text_embeds: [batch, 1280] - pooled text embedding
                 # time_ids: [batch, 6] - original_size, crops_coords_top_left, target_size
-                text_embeds = torch.zeros(batch_size, 1280, device=device, dtype=dtype)
-                time_ids = torch.zeros(batch_size, 6, device=device, dtype=dtype)
+                text_embeds = batch.get("text_embeds")
+                time_ids = batch.get("time_ids")
+                
+                # Create default values if not provided
+                if text_embeds is None:
+                    text_embeds = torch.zeros(batch_size, 1280, device=device, dtype=dtype)
+                elif isinstance(device, torch.device) and isinstance(dtype, torch.dtype):
+                    text_embeds = text_embeds.to(device=device, dtype=dtype)
+                
+                if time_ids is None:
+                    # Default time_ids: [original_h, original_w, crop_top, crop_left, target_h, target_w]
+                    # Using 512x512 as default
+                    time_ids = torch.tensor(
+                        [[512.0, 512.0, 0.0, 0.0, 512.0, 512.0]] * batch_size,
+                        device=device, dtype=dtype
+                    )
+                elif isinstance(device, torch.device) and isinstance(dtype, torch.dtype):
+                    time_ids = time_ids.to(device=device, dtype=dtype)
                 
                 added_cond_kwargs = {
                     "text_embeds": text_embeds,
@@ -295,26 +429,29 @@ class INT8Quantizer:
                 }
                 
                 return model(
-                    batch["sample"],
-                    batch["timestep"],
-                    encoder_hidden_states=batch["encoder_hidden_states"],
+                    sample,
+                    timestep,
+                    encoder_hidden_states=encoder_hidden_states,
                     added_cond_kwargs=added_cond_kwargs,
                 )
             else:
                 # Standard SD 1.5 / SD 2.x forward
                 return model(
-                    batch["sample"],
-                    batch["timestep"],
-                    encoder_hidden_states=batch["encoder_hidden_states"],
+                    sample,
+                    timestep,
+                    encoder_hidden_states=encoder_hidden_states,
                 )
     
     def _create_exclude_filter(self) -> Optional[Callable]:
         """Create a filter function for layer exclusion."""
-        if not self.config.exclude_layers:
+        exclude_layers = self.config.get_effective_exclude_layers()
+        if not exclude_layers:
             return None
         
         def should_exclude(name: str) -> bool:
-            for pattern in self.config.exclude_layers:
+            if name is None:
+                return True  # Exclude None names
+            for pattern in exclude_layers:
                 if pattern in name:
                     return True
             return False
@@ -323,17 +460,26 @@ class INT8Quantizer:
     
     def _apply_layer_exclusions(self, model: nn.Module) -> None:
         """Convert excluded layers back to FP16."""
-        if not self.config.exclude_layers:
+        exclude_layers = self.config.get_effective_exclude_layers()
+        if not exclude_layers:
             return
         
+        excluded_count = 0
         for name, module in model.named_modules():
-            for pattern in self.config.exclude_layers:
+            if name is None:
+                continue
+            for pattern in exclude_layers:
                 if pattern in name:
                     # Convert module parameters to FP16
                     for param in module.parameters():
-                        param.data = param.data.to(torch.float16)
+                        if param.data.dtype != torch.float16:
+                            param.data = param.data.to(torch.float16)
+                    excluded_count += 1
                     logger.debug(f"Excluded layer from quantization: {name}")
                     break
+        
+        if excluded_count > 0:
+            logger.info(f"Converted {excluded_count} layers back to FP16")
     
     def validate_accuracy(
         self,

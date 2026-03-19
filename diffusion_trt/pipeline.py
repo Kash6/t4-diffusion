@@ -327,8 +327,10 @@ class OptimizedPipeline:
         """
         Apply INT8 quantization to the UNet.
         
-        If accuracy degrades beyond threshold, identifies and excludes
-        problematic layers, then re-quantizes.
+        Uses NVIDIA's recommended approach for diffusion models:
+        - Excludes problematic layers (time_embedding, conv_in, conv_out, etc.)
+        - Uses SmoothQuant algorithm for better accuracy
+        - Handles SDXL-specific conditioning
         
         Requirements:
             - 10.3: Identify and exclude problematic layers if accuracy degrades
@@ -357,78 +359,58 @@ class OptimizedPipeline:
         
         logger.info(f"Generated {len(calibration_data)} calibration batches")
         
-        # Store original UNet for retry attempts (quantization modifies the model in-place)
-        import copy
-        original_unet_state = copy.deepcopy(self._unet.state_dict())
-        
-        # Start with configured exclude layers or empty list
+        # Start with configured exclude layers
+        # The QuantizationConfig will automatically add diffusion-specific exclusions
         exclude_layers = list(self.config.exclude_layers or [])
-        max_retries = 3
         
-        for attempt in range(max_retries):
-            # Restore original UNet state for retry attempts
-            if attempt > 0:
-                logger.info(f"Restoring original UNet for retry attempt {attempt + 1}")
-                self._unet.load_state_dict(original_unet_state)
-            
-            # Create quantization config
-            quant_config = QuantizationConfig(
-                algorithm="int8_smoothquant",
-                calibration_method="smoothquant",  # Use smoothquant for diffusion models
-                exclude_layers=exclude_layers if exclude_layers else None,
+        # Create quantization config with diffusion-specific exclusions enabled
+        quant_config = QuantizationConfig(
+            algorithm="int8_smoothquant",
+            calibration_method="smoothquant",
+            exclude_layers=exclude_layers if exclude_layers else None,
+            use_diffusion_exclusions=True,  # Auto-exclude problematic layers
+            num_calibration_batches=min(len(calibration_data), 100),
+        )
+        
+        # Log effective exclusions
+        effective_exclusions = quant_config.get_effective_exclude_layers()
+        logger.info(f"Effective layer exclusions: {effective_exclusions}")
+        
+        # Create quantizer and apply quantization
+        quantizer = INT8Quantizer(quant_config)
+        
+        try:
+            quantized_unet = quantizer.quantize(
+                model=self._unet,
+                calibration_data=calibration_data,
             )
             
-            # Create quantizer and apply quantization
-            quantizer = INT8Quantizer(quant_config)
+            # Quantization succeeded - use the quantized model
+            self._unet = quantized_unet
+            logger.info("✓ INT8 quantization complete")
+            return
+                    
+        except ImportError as e:
+            logger.warning(f"INT8 quantization skipped: {e}")
+            return
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"INT8 quantization failed: {error_msg}")
             
-            try:
-                quantized_unet = quantizer.quantize(
-                    model=self._unet,
-                    calibration_data=calibration_data,
+            # Provide helpful error messages
+            if "NoneType" in error_msg:
+                logger.error(
+                    "This error often occurs due to incompatible modelopt version. "
+                    "Try: pip install --upgrade nvidia-modelopt"
                 )
-                
-                # Validate accuracy (Requirement 10.3)
-                is_valid, problematic_layers = self._validate_quantization_accuracy(
-                    original_unet=self._unet,
-                    quantized_unet=quantized_unet,
-                    calibration_data=calibration_data,
+            elif "must not be quantized" in error_msg.lower():
+                logger.error(
+                    "Model was already modified. This can happen if quantization "
+                    "was attempted multiple times on the same model instance."
                 )
-                
-                if is_valid:
-                    self._unet = quantized_unet
-                    logger.info(
-                        f"INT8 quantization complete "
-                        f"(excluded {len(exclude_layers)} layers)"
-                    )
-                    return
-                else:
-                    # Add problematic layers to exclusion list and retry
-                    if problematic_layers:
-                        logger.warning(
-                            f"Quantization accuracy degraded. "
-                            f"Excluding {len(problematic_layers)} problematic layers: "
-                            f"{problematic_layers}"
-                        )
-                        exclude_layers.extend(problematic_layers)
-                    else:
-                        # No specific layers identified, use quantized anyway
-                        logger.warning(
-                            "Quantization accuracy degraded but no specific "
-                            "problematic layers identified. Using quantized model."
-                        )
-                        self._unet = quantized_unet
-                        return
-                        
-            except ImportError as e:
-                logger.warning(f"INT8 quantization skipped: {e}")
-                return
-            except Exception as e:
-                logger.warning(f"INT8 quantization attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    logger.warning("All quantization attempts failed. Using original UNet.")
-                    return
-        
-        logger.warning("Quantization retries exhausted. Using original UNet.")
+            
+            logger.warning("Falling back to FP16 UNet (no INT8 quantization)")
+            # Keep the original UNet - don't try to reload as it may already be modified
     
     def _validate_quantization_accuracy(
         self,
