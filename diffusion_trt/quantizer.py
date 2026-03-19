@@ -168,8 +168,6 @@ class INT8Quantizer:
         try:
             import modelopt.torch.quantization as mtq
             from modelopt.torch.quantization import INT8_SMOOTHQUANT_CFG, INT8_DEFAULT_CFG
-            # Import calibration functions for modelopt 0.39+
-            from modelopt.torch.quantization.model_calib import max_calibrate, smoothquant
         except ImportError:
             raise ImportError(
                 "nvidia-modelopt is required for INT8 quantization. "
@@ -210,23 +208,9 @@ class INT8Quantizer:
         logger.info(f"Applying INT8 quantization with {self.config.algorithm}")
         logger.info(f"Calibration data: {len(calibration_data)} batches")
         
-        # First, insert quantizers into the model
-        quantized_model = mtq.quantize(model, quant_cfg)
-        
-        # Then calibrate using the appropriate method (modelopt 0.39+ API)
-        calib_method = CALIBRATION_METHOD_MAP.get(
-            self.config.calibration_method, 
-            self.config.calibration_method
-        )
-        
-        logger.info(f"Running calibration with method: {calib_method}")
-        
-        if calib_method == "smoothquant" or self.config.algorithm == "int8_smoothquant":
-            # Use SmoothQuant calibration (recommended for diffusion models)
-            smoothquant(quantized_model, forward_loop=calibration_loop, alpha=0.8)
-        else:
-            # Use max calibration (default)
-            max_calibrate(quantized_model, forward_loop=calibration_loop)
+        # Apply quantization with calibration in one step (modelopt API)
+        # The forward_loop is passed to mtq.quantize for calibration
+        quantized_model = mtq.quantize(model, quant_cfg, forward_loop=calibration_loop)
         
         # Apply exclusions by converting specified layers back to FP16
         if self.config.exclude_layers:
