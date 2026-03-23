@@ -590,22 +590,70 @@ class OptimizedPipeline:
             dtype=torch.float16,
         )
         sample_timestep = torch.tensor([500], device="cuda", dtype=torch.long)
+        
+        # Detect SDXL: dual encoders produce 2048-dim embeddings (768 + 1280)
+        is_sdxl = (
+            hasattr(self._pipeline, 'text_encoder_2') and
+            self._pipeline.text_encoder_2 is not None
+        )
+        if not is_sdxl and self._unet is not None:
+            unet_cfg = getattr(self._unet, 'config', None)
+            if unet_cfg is not None:
+                cross_attn_dim = getattr(unet_cfg, 'cross_attention_dim', 768)
+                is_sdxl = cross_attn_dim == 2048
+        
+        encoder_hidden_dim = 2048 if is_sdxl else 768
         sample_encoder_hidden = torch.randn(
-            1, 77, 768,  # Standard CLIP embedding size
+            1, 77, encoder_hidden_dim,
             device="cuda",
             dtype=torch.float16,
         )
         
-        sample_inputs = [sample_latents, sample_timestep, sample_encoder_hidden]
+        # For SDXL, added_cond_kwargs must be passed as keyword args to the UNet.
+        # torch.export requires a flat positional signature, so we wrap the UNet.
+        if is_sdxl:
+            sample_text_embeds = torch.randn(1, 1280, device="cuda", dtype=torch.float16)
+            sample_time_ids = torch.tensor(
+                [[512.0, 512.0, 0.0, 0.0, 512.0, 512.0]], device="cuda", dtype=torch.float16
+            )
+            sample_inputs = [
+                sample_latents, sample_timestep, sample_encoder_hidden,
+                sample_text_embeds, sample_time_ids,
+            ]
+            
+            # Wrap UNet so all inputs are positional (required for torch.export)
+            unet_inner = self._unet
+            
+            class SDXLUNetWrapper(nn.Module):
+                def forward(self, sample, timestep, encoder_hidden_states,
+                            text_embeds, time_ids):
+                    return unet_inner(
+                        sample,
+                        timestep,
+                        encoder_hidden_states=encoder_hidden_states,
+                        added_cond_kwargs={
+                            "text_embeds": text_embeds,
+                            "time_ids": time_ids,
+                        },
+                    )
+            
+            compile_model = SDXLUNetWrapper().eval()
+        else:
+            sample_inputs = [sample_latents, sample_timestep, sample_encoder_hidden]
+            compile_model = self._unet
         
         # Create builder and compile
         builder = TensorRTBuilder(trt_config)
         
         try:
-            self._trt_unet = builder.compile_torchtrt(
-                model=self._unet,
+            compiled = builder.compile_torchtrt(
+                model=compile_model,
                 sample_inputs=sample_inputs,
             )
+            # For SDXL, store the wrapper; inference code must call with flat args
+            # or we unwrap below. We store the original unet reference for __call__.
+            self._trt_unet = compiled
+            self._trt_unet_is_sdxl_wrapper = is_sdxl
             logger.info("TensorRT compilation complete")
         except ImportError as e:
             logger.warning(f"TensorRT compilation skipped: {e}")

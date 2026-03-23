@@ -161,48 +161,92 @@ class TensorRTBuilder:
             f"optimization_level={self.config.optimization_level}"
         )
         
+        # Determine enabled precisions
+        if self.config.precision == "fp32":
+            enabled_precisions = {torch.float32}
+        elif self.config.precision == "fp16":
+            enabled_precisions = {torch.float16, torch.float32}
+        else:  # int8
+            enabled_precisions = {torch.int8, torch.float16, torch.float32}
+        
         try:
-            # Modelopt-quantized models contain dynamic callback objects (_FoldedCallback)
-            # that TorchDynamo cannot trace via torch.compile(backend="torch_tensorrt").
-            # Solution: export to a static FX graph first, then compile with dynamo backend.
+            # Strategy 1: torch.export + dynamo.compile with torch_tensorrt.Input wrappers.
+            # Raw tensors as inputs can trigger "NoneType is not iterable" inside
+            # torch-tensorrt 2.7.0 when the exported graph has None metadata.
+            # Wrapping inputs as torch_tensorrt.Input avoids that code path.
             logger.info("Exporting model to FX graph via torch.export...")
             
-            exported_program = torch.export.export(
-                model,
-                args=tuple(sample_inputs),
-                strict=False,  # Required for quantized models with non-standard objects
-            )
+            exported_program = None
+            try:
+                exported_program = torch.export.export(
+                    model,
+                    args=tuple(sample_inputs),
+                    strict=False,
+                )
+                logger.info("Export succeeded.")
+            except Exception as export_err:
+                logger.warning(
+                    f"torch.export failed: {export_err}. "
+                    f"Trying torch.compile backend path."
+                )
             
-            logger.info("Export complete. Compiling with torch_tensorrt.dynamo.compile...")
+            if exported_program is not None:
+                try:
+                    # Wrap inputs as torch_tensorrt.Input to avoid NoneType iteration bug
+                    trt_inputs = [
+                        torch_tensorrt.Input(
+                            shape=t.shape,
+                            dtype=t.dtype,
+                        )
+                        for t in sample_inputs
+                    ]
+                    logger.info("Compiling with torch_tensorrt.dynamo.compile (Input wrappers)...")
+                    compiled_model = torch_tensorrt.dynamo.compile(
+                        exported_program,
+                        inputs=trt_inputs,
+                        enabled_precisions=enabled_precisions,
+                        optimization_level=self.config.optimization_level,
+                        workspace_size=self.config.workspace_size,
+                        min_block_size=1,
+                        truncate_double=True,
+                        debug=False,
+                    )
+                    # Warm up
+                    with torch.no_grad():
+                        _ = compiled_model(*sample_inputs)
+                    self._compiled_model = compiled_model
+                    logger.info("TensorRT compilation complete (dynamo path)")
+                    return compiled_model
+                except Exception as dynamo_err:
+                    logger.warning(
+                        f"dynamo.compile failed: {dynamo_err}. "
+                        f"Falling back to torch.compile(backend='torch_tensorrt')."
+                    )
             
-            # Determine enabled precisions
-            if self.config.precision == "fp32":
-                enabled_precisions = {torch.float32}
-            elif self.config.precision == "fp16":
-                enabled_precisions = {torch.float16, torch.float32}
-            else:  # int8
-                enabled_precisions = {torch.int8, torch.float16, torch.float32}
-            
-            compiled_model = torch_tensorrt.dynamo.compile(
-                exported_program,
-                inputs=sample_inputs,
-                enabled_precisions=enabled_precisions,
-                optimization_level=self.config.optimization_level,
-                workspace_size=self.config.workspace_size,
-                min_block_size=1,
-                truncate_double=True,
-            )
-            
-            # Warm up the compiled model
+            # Strategy 2: torch.compile with torch_tensorrt backend.
+            # This path handles quantized models better in some torch-tensorrt versions.
+            logger.info("Compiling with torch.compile(backend='torch_tensorrt')...")
+            compile_kwargs = {
+                "backend": "torch_tensorrt",
+                "options": {
+                    "enabled_precisions": enabled_precisions,
+                    "workspace_size": self.config.workspace_size,
+                    "min_block_size": 1,
+                    "truncate_double": True,
+                    "optimization_level": self.config.optimization_level,
+                    "debug": False,
+                },
+            }
+            compiled_model = torch.compile(model, **compile_kwargs)
+            # Warm up to trigger actual compilation
             with torch.no_grad():
                 _ = compiled_model(*sample_inputs)
-            
             self._compiled_model = compiled_model
-            logger.info("TensorRT compilation complete")
+            logger.info("TensorRT compilation complete (torch.compile backend path)")
             return compiled_model
             
         except Exception as e:
-            logger.error(f"TensorRT compilation failed: {e}")
+            logger.error(f"TensorRT compilation failed: {e}", exc_info=True)
             raise RuntimeError(f"Failed to compile model with TensorRT: {e}")
     
     def _build_compile_settings(
