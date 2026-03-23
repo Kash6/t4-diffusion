@@ -161,29 +161,36 @@ class TensorRTBuilder:
             f"optimization_level={self.config.optimization_level}"
         )
         
-        # Build compilation settings
-        compile_settings = self._build_compile_settings(sample_inputs)
-        
         try:
             # Modelopt-quantized models contain dynamic callback objects (_FoldedCallback)
-            # that TorchDynamo cannot trace. We must export to a static FX graph first,
-            # then compile that with torch_tensorrt.compile (dynamo IR).
+            # that TorchDynamo cannot trace via torch.compile(backend="torch_tensorrt").
+            # Solution: export to a static FX graph first, then compile with dynamo backend.
             logger.info("Exporting model to FX graph via torch.export...")
             
-            # Build dynamic shape specs so export handles variable batch/sequence dims
-            # Sample inputs are: [latents, timestep, encoder_hidden_states]
             exported_program = torch.export.export(
                 model,
                 args=tuple(sample_inputs),
-                strict=False,  # Allow non-strict export for quantized models
+                strict=False,  # Required for quantized models with non-standard objects
             )
             
-            logger.info("Export complete. Compiling with torch_tensorrt...")
+            logger.info("Export complete. Compiling with torch_tensorrt.dynamo.compile...")
+            
+            # Determine enabled precisions
+            if self.config.precision == "fp32":
+                enabled_precisions = {torch.float32}
+            elif self.config.precision == "fp16":
+                enabled_precisions = {torch.float16, torch.float32}
+            else:  # int8
+                enabled_precisions = {torch.int8, torch.float16, torch.float32}
             
             compiled_model = torch_tensorrt.dynamo.compile(
                 exported_program,
                 inputs=sample_inputs,
-                **compile_settings,
+                enabled_precisions=enabled_precisions,
+                optimization_level=self.config.optimization_level,
+                workspace_size=self.config.workspace_size,
+                min_block_size=1,
+                truncate_double=True,
             )
             
             # Warm up the compiled model
@@ -191,9 +198,7 @@ class TensorRTBuilder:
                 _ = compiled_model(*sample_inputs)
             
             self._compiled_model = compiled_model
-            
             logger.info("TensorRT compilation complete")
-            
             return compiled_model
             
         except Exception as e:
@@ -204,8 +209,7 @@ class TensorRTBuilder:
         self,
         sample_inputs: List[torch.Tensor]
     ) -> Dict[str, Any]:
-        """Build torch_tensorrt.dynamo.compile settings."""
-        # Determine enabled precisions
+        """Build torch_tensorrt.dynamo.compile settings (kept for reference)."""
         if self.config.precision == "fp32":
             enabled_precisions = {torch.float32}
         elif self.config.precision == "fp16":
@@ -213,19 +217,13 @@ class TensorRTBuilder:
         else:  # int8
             enabled_precisions = {torch.int8, torch.float16, torch.float32}
         
-        settings = {
+        return {
             "enabled_precisions": enabled_precisions,
             "workspace_size": self.config.workspace_size,
             "truncate_double": True,
             "min_block_size": 1,
             "optimization_level": self.config.optimization_level,
-            "use_python_runtime": False,
         }
-        
-        if self.config.use_cuda_graph:
-            settings["use_explicit_typing"] = False  # Needed for CUDA graphs compat
-        
-        return settings
     
     def build_engine(
         self,
