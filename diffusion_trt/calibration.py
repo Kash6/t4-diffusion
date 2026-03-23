@@ -162,18 +162,23 @@ class CalibrationEngine:
         prompts: List[str],
         text_encoder: nn.Module,
         tokenizer,
+        text_encoder_2: Optional[nn.Module] = None,
+        tokenizer_2=None,
     ) -> Iterator[Dict[str, torch.Tensor]]:
         """
         Generate calibration data batches as a streaming iterator.
         
         Creates calibration samples with latents, timesteps, and encoder hidden
-        states. Uses streaming iteration to minimize memory footprint.
+        states. Supports SDXL dual-encoder setup (text_encoder + text_encoder_2).
+        Uses streaming iteration to minimize memory footprint.
         
         Args:
             prompts: List of text prompts for calibration. If fewer than num_samples,
                     prompts will be cycled.
-            text_encoder: Text encoder module from the diffusion pipeline
-            tokenizer: Tokenizer for encoding text prompts
+            text_encoder: Primary text encoder module from the diffusion pipeline
+            tokenizer: Primary tokenizer for encoding text prompts
+            text_encoder_2: Optional second text encoder (SDXL only)
+            tokenizer_2: Optional second tokenizer (SDXL only)
             
         Yields:
             Dictionary containing:
@@ -188,7 +193,6 @@ class CalibrationEngine:
         """
         # Extend prompts if needed to reach num_samples
         if len(prompts) < self.config.num_samples:
-            # Cycle through prompts to reach desired sample count
             extended_prompts = []
             for i in range(self.config.num_samples):
                 extended_prompts.append(prompts[i % len(prompts)])
@@ -199,8 +203,12 @@ class CalibrationEngine:
         # Determine device from text encoder
         device = next(text_encoder.parameters()).device
         
-        # Set text encoder to eval mode
+        # Set text encoders to eval mode
         text_encoder.eval()
+        if text_encoder_2 is not None:
+            text_encoder_2.eval()
+        
+        is_sdxl = text_encoder_2 is not None and tokenizer_2 is not None
         
         # Generate samples in batches (streaming to minimize memory)
         num_batches = (self.config.num_samples + self.config.batch_size - 1) // self.config.batch_size
@@ -226,24 +234,34 @@ class CalibrationEngine:
             # Sample random timesteps uniformly across the diffusion schedule
             timesteps = torch.randint(
                 0,
-                1000,  # Standard diffusion schedule has 1000 timesteps
+                1000,
                 (actual_batch_size,),
                 device=device,
                 dtype=torch.long,
             )
             
             # Encode prompts to get encoder hidden states
-            # Requirement 2.2: Use pipeline's text encoder and tokenizer
             with torch.no_grad():
-                encoder_hidden_states = self._encode_prompts(
-                    batch_prompts,
-                    text_encoder,
-                    tokenizer,
-                    device,
-                )
+                if is_sdxl:
+                    # SDXL: concatenate outputs from both text encoders
+                    # encoder 1: [batch, 77, 768]
+                    # encoder 2: [batch, 77, 1280]
+                    # concatenated: [batch, 77, 2048]
+                    hidden_states_1 = self._encode_prompts(
+                        batch_prompts, text_encoder, tokenizer, device
+                    )
+                    hidden_states_2 = self._encode_prompts(
+                        batch_prompts, text_encoder_2, tokenizer_2, device,
+                        output_hidden_states=True,
+                    )
+                    encoder_hidden_states = torch.cat(
+                        [hidden_states_1, hidden_states_2], dim=-1
+                    )
+                else:
+                    encoder_hidden_states = self._encode_prompts(
+                        batch_prompts, text_encoder, tokenizer, device
+                    )
             
-            # Yield batch as dictionary
-            # Requirement 2.3: Include latents, timesteps, and encoder hidden states
             yield {
                 "sample": latents,
                 "timestep": timesteps,
@@ -256,6 +274,7 @@ class CalibrationEngine:
         text_encoder: nn.Module,
         tokenizer,
         device: torch.device,
+        output_hidden_states: bool = False,
     ) -> torch.Tensor:
         """
         Encode text prompts to embeddings using the text encoder.
@@ -265,6 +284,8 @@ class CalibrationEngine:
             text_encoder: Text encoder module
             tokenizer: Tokenizer for text processing
             device: Target device for tensors
+            output_hidden_states: If True, return penultimate hidden states
+                (used for SDXL's second text encoder which outputs 1280-dim)
             
         Returns:
             Encoded prompt embeddings tensor
@@ -282,15 +303,25 @@ class CalibrationEngine:
         
         # Get encoder hidden states
         with torch.no_grad():
-            encoder_output = text_encoder(input_ids)
-            
-            # Handle different text encoder output formats
-            if hasattr(encoder_output, "last_hidden_state"):
-                encoder_hidden_states = encoder_output.last_hidden_state
-            elif isinstance(encoder_output, tuple):
-                encoder_hidden_states = encoder_output[0]
+            if output_hidden_states:
+                # For SDXL's second encoder (OpenCLIP ViT-bigG), we need the
+                # penultimate hidden state (second-to-last layer), not the final output.
+                # This gives [batch, 77, 1280] instead of the pooled [batch, 1280].
+                encoder_output = text_encoder(
+                    input_ids, output_hidden_states=True
+                )
+                # penultimate hidden state: hidden_states[-2]
+                encoder_hidden_states = encoder_output.hidden_states[-2]
             else:
-                encoder_hidden_states = encoder_output
+                encoder_output = text_encoder(input_ids)
+                
+                # Handle different text encoder output formats
+                if hasattr(encoder_output, "last_hidden_state"):
+                    encoder_hidden_states = encoder_output.last_hidden_state
+                elif isinstance(encoder_output, tuple):
+                    encoder_hidden_states = encoder_output[0]
+                else:
+                    encoder_hidden_states = encoder_output
         
         return encoder_hidden_states.to(dtype=torch.float16)
     

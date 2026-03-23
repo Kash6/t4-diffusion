@@ -351,11 +351,30 @@ class OptimizedPipeline:
         
         # Generate calibration data - convert to list so it can be reused on retries
         prompts = calib_engine.get_default_prompts()
-        calibration_data = list(calib_engine.create_dataset(
-            prompts=prompts,
-            text_encoder=self._pipeline.text_encoder,
-            tokenizer=self._pipeline.tokenizer,
-        ))
+        
+        # Detect SDXL by checking for second text encoder
+        has_second_encoder = (
+            hasattr(self._pipeline, 'text_encoder_2') and
+            self._pipeline.text_encoder_2 is not None and
+            hasattr(self._pipeline, 'tokenizer_2') and
+            self._pipeline.tokenizer_2 is not None
+        )
+        
+        if has_second_encoder:
+            logger.info("SDXL detected: using dual text encoders for calibration")
+            calibration_data = list(calib_engine.create_dataset(
+                prompts=prompts,
+                text_encoder=self._pipeline.text_encoder,
+                tokenizer=self._pipeline.tokenizer,
+                text_encoder_2=self._pipeline.text_encoder_2,
+                tokenizer_2=self._pipeline.tokenizer_2,
+            ))
+        else:
+            calibration_data = list(calib_engine.create_dataset(
+                prompts=prompts,
+                text_encoder=self._pipeline.text_encoder,
+                tokenizer=self._pipeline.tokenizer,
+            ))
         
         logger.info(f"Generated {len(calibration_data)} calibration batches")
         
