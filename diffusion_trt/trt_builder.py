@@ -149,8 +149,9 @@ class TensorRTBuilder:
             # Handle library loading issues
             raise ImportError(
                 f"torch-tensorrt library failed to load: {e}. "
-                "This may be due to CUDA version mismatch. "
-                "Try: pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu128"
+                "This is likely a PyTorch/CUDA version mismatch. "
+                "Colab ships PyTorch 2.7.x (cu126). Install the matching version:\n"
+                "  pip install torch-tensorrt==2.7.0 --extra-index-url https://download.pytorch.org/whl/cu128"
             )
         
         model.eval()
