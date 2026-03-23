@@ -352,13 +352,33 @@ class OptimizedPipeline:
         # Generate calibration data - convert to list so it can be reused on retries
         prompts = calib_engine.get_default_prompts()
         
-        # Detect SDXL by checking for second text encoder
+        # Detect SDXL by checking for second text encoder AND by inspecting
+        # the UNet's expected cross-attention dimension. SDXL UNet expects
+        # 2048-dim embeddings (768 + 1280 from dual CLIP encoders).
         has_second_encoder = (
             hasattr(self._pipeline, 'text_encoder_2') and
             self._pipeline.text_encoder_2 is not None and
             hasattr(self._pipeline, 'tokenizer_2') and
             self._pipeline.tokenizer_2 is not None
         )
+        
+        # Also check UNet config as a fallback SDXL detection method
+        if not has_second_encoder and self._unet is not None:
+            unet_config = getattr(self._unet, 'config', None)
+            if unet_config is not None:
+                cross_attn_dim = getattr(unet_config, 'cross_attention_dim', None)
+                addition_embed_type = getattr(unet_config, 'addition_embed_type', None)
+                if cross_attn_dim == 2048 or addition_embed_type == "text_time":
+                    logger.warning(
+                        "UNet config indicates SDXL (cross_attention_dim=2048 or "
+                        "addition_embed_type=text_time) but text_encoder_2 not found "
+                        "on pipeline. Attempting to access text_encoder_2 directly."
+                    )
+                    # Try to get text_encoder_2 from pipeline components
+                    te2 = getattr(self._pipeline, 'text_encoder_2', None)
+                    tok2 = getattr(self._pipeline, 'tokenizer_2', None)
+                    if te2 is not None and tok2 is not None:
+                        has_second_encoder = True
         
         if has_second_encoder:
             logger.info("SDXL detected: using dual text encoders for calibration")
@@ -370,6 +390,15 @@ class OptimizedPipeline:
                 tokenizer_2=self._pipeline.tokenizer_2,
             ))
         else:
+            # Check if UNet expects a larger embedding dim than single CLIP provides
+            unet_config = getattr(self._unet, 'config', None) if self._unet else None
+            cross_attn_dim = getattr(unet_config, 'cross_attention_dim', 768) if unet_config else 768
+            if cross_attn_dim != 768:
+                logger.warning(
+                    f"UNet expects cross_attention_dim={cross_attn_dim} but only "
+                    f"single text encoder found (produces 768-dim). "
+                    f"Calibration may fail. Check that text_encoder_2 is available."
+                )
             calibration_data = list(calib_engine.create_dataset(
                 prompts=prompts,
                 text_encoder=self._pipeline.text_encoder,
@@ -377,6 +406,16 @@ class OptimizedPipeline:
             ))
         
         logger.info(f"Generated {len(calibration_data)} calibration batches")
+        
+        # Log calibration data shapes for debugging
+        if calibration_data:
+            sample_batch = calibration_data[0]
+            enc_shape = sample_batch.get('encoder_hidden_states', torch.tensor([])).shape
+            latent_shape = sample_batch.get('sample', torch.tensor([])).shape
+            logger.info(
+                f"Calibration batch shapes: latents={latent_shape}, "
+                f"encoder_hidden_states={enc_shape}"
+            )
         
         # Start with configured exclude layers
         # The QuantizationConfig will automatically add diffusion-specific exclusions

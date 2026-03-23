@@ -376,6 +376,16 @@ class INT8Quantizer:
                 addition_embed_type = getattr(model_config, 'addition_embed_type', None)
                 is_sdxl = addition_embed_type == "text_time"
             
+            # Also detect SDXL by cross_attention_dim or encoder_hidden_states shape
+            if not is_sdxl:
+                cross_attn_dim = None
+                if model_config is not None:
+                    cross_attn_dim = getattr(model_config, 'cross_attention_dim', None)
+                # If encoder_hidden_states has 2048 features, it's SDXL
+                if (cross_attn_dim == 2048 or 
+                        encoder_hidden_states.shape[-1] == 2048):
+                    is_sdxl = True
+            
             if is_sdxl:
                 # SDXL requires additional conditioning
                 batch_size = sample.shape[0]
