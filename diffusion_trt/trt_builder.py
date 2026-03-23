@@ -165,20 +165,26 @@ class TensorRTBuilder:
         compile_settings = self._build_compile_settings(sample_inputs)
         
         try:
-            # Use torch.compile with tensorrt backend
-            if self.config.use_cuda_graph:
-                # Enable CUDA graphs for better performance
-                compiled_model = torch.compile(
-                    model,
-                    backend="torch_tensorrt",
-                    options=compile_settings,
-                )
-            else:
-                compiled_model = torch.compile(
-                    model,
-                    backend="torch_tensorrt",
-                    options=compile_settings,
-                )
+            # Modelopt-quantized models contain dynamic callback objects (_FoldedCallback)
+            # that TorchDynamo cannot trace. We must export to a static FX graph first,
+            # then compile that with torch_tensorrt.compile (dynamo IR).
+            logger.info("Exporting model to FX graph via torch.export...")
+            
+            # Build dynamic shape specs so export handles variable batch/sequence dims
+            # Sample inputs are: [latents, timestep, encoder_hidden_states]
+            exported_program = torch.export.export(
+                model,
+                args=tuple(sample_inputs),
+                strict=False,  # Allow non-strict export for quantized models
+            )
+            
+            logger.info("Export complete. Compiling with torch_tensorrt...")
+            
+            compiled_model = torch_tensorrt.dynamo.compile(
+                exported_program,
+                inputs=sample_inputs,
+                **compile_settings,
+            )
             
             # Warm up the compiled model
             with torch.no_grad():
@@ -198,8 +204,8 @@ class TensorRTBuilder:
         self,
         sample_inputs: List[torch.Tensor]
     ) -> Dict[str, Any]:
-        """Build torch.compile settings for TensorRT backend."""
-        # Determine dtype based on precision
+        """Build torch_tensorrt.dynamo.compile settings."""
+        # Determine enabled precisions
         if self.config.precision == "fp32":
             enabled_precisions = {torch.float32}
         elif self.config.precision == "fp16":
@@ -210,13 +216,14 @@ class TensorRTBuilder:
         settings = {
             "enabled_precisions": enabled_precisions,
             "workspace_size": self.config.workspace_size,
-            "truncate_long_and_double": True,
+            "truncate_double": True,
             "min_block_size": 1,
+            "optimization_level": self.config.optimization_level,
+            "use_python_runtime": False,
         }
         
-        # Add dynamic shape settings if enabled
-        if self.config.dynamic_shapes:
-            settings["dynamic_batch"] = True
+        if self.config.use_cuda_graph:
+            settings["use_explicit_typing"] = False  # Needed for CUDA graphs compat
         
         return settings
     
