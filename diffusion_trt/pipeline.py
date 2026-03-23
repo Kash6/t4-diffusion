@@ -642,6 +642,20 @@ class OptimizedPipeline:
             sample_inputs = [sample_latents, sample_timestep, sample_encoder_hidden]
             compile_model = self._unet
         
+        # CRITICAL: Finalize quantization before TensorRT compilation.
+        # Modelopt-quantized models have _FoldedCallback objects that TorchDynamo
+        # cannot trace. We must disable quantizers to fold them into weights.
+        if self.config.enable_int8:
+            try:
+                import modelopt.torch.quantization as mtq
+                logger.info("Finalizing INT8 quantization (disabling quantizers)...")
+                # Disable all quantizers - this folds them into weights and removes
+                # dynamic callbacks, making the model torch.compile-friendly
+                mtq.disable_quantizer(compile_model)
+                logger.info("Quantization finalized - quantizers folded into weights")
+            except Exception as e:
+                logger.warning(f"Failed to finalize quantization: {e}. Trying without finalization.")
+        
         # Create builder and compile
         builder = TensorRTBuilder(trt_config)
         
