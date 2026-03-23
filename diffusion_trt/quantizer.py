@@ -277,8 +277,9 @@ class INT8Quantizer:
         """
         Create a custom quantization config for diffusion models.
         
-        Based on NVIDIA's TensorRT demo approach which uses a filter function
-        to exclude problematic layers from quantization.
+        Disables quantization for problematic layers by setting enable=False
+        for matching layer name patterns. This is the correct modelopt API
+        for layer exclusion (filter_func is NOT a valid field).
         
         Args:
             exclude_layers: List of layer name patterns to exclude
@@ -298,43 +299,21 @@ class INT8Quantizer:
         else:
             base_cfg = INT8_DEFAULT_CFG.copy()
         
-        # Create filter function to exclude specified layers
-        def filter_func(name: str) -> bool:
-            """
-            Filter function for layer quantization.
-            
-            Returns True if the layer should be quantized, False to skip.
-            """
-            if name is None:
-                return False
-            
-            # Check if any exclude pattern matches
-            for pattern in exclude_layers:
-                if pattern in name:
-                    logger.debug(f"Excluding layer from quantization: {name}")
-                    return False
-            
-            return True
+        # Deep copy the quant_cfg to avoid mutating the global config
+        import copy
+        quant_cfg = copy.deepcopy(base_cfg)
         
-        # Add filter function to config
-        # The filter_func is used by modelopt to decide which layers to quantize
-        quant_cfg = base_cfg.copy()
+        # Disable quantization for excluded layers using the correct modelopt API:
+        # Set {"enable": False} for each pattern - this disables ALL quantizers
+        # (input, weight, output) for any layer whose name contains the pattern.
+        for pattern in exclude_layers:
+            # The key format "*<pattern>*" matches any layer name containing the pattern
+            quant_cfg["quant_cfg"][f"*{pattern}*"] = {"enable": False}
+            logger.debug(f"Disabling quantization for layers matching: *{pattern}*")
         
-        # Try to set the filter function - API may vary by modelopt version
-        try:
-            # modelopt 0.39+ API
-            quant_cfg["quant_cfg"]["*"]["filter_func"] = filter_func
-        except (KeyError, TypeError):
-            try:
-                # Alternative API structure
-                if "quant_cfg" not in quant_cfg:
-                    quant_cfg["quant_cfg"] = {}
-                if "*" not in quant_cfg["quant_cfg"]:
-                    quant_cfg["quant_cfg"]["*"] = {}
-                quant_cfg["quant_cfg"]["*"]["filter_func"] = filter_func
-            except Exception as e:
-                logger.warning(f"Could not set filter_func in quant config: {e}")
-                # Fall back to post-quantization exclusion
+        logger.info(
+            f"Created diffusion quant config with {len(exclude_layers)} exclusion patterns"
+        )
         
         return quant_cfg
     
