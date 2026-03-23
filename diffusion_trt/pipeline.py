@@ -609,6 +609,22 @@ class OptimizedPipeline:
             dtype=torch.float16,
         )
         
+        # CRITICAL: Finalize quantization BEFORE wrapping for SDXL.
+        # Modelopt-quantized models have _FoldedCallback objects that TorchDynamo
+        # cannot trace. We must disable quantizers to fold them into weights.
+        # This must be done on the actual UNet, not on a wrapper.
+        if self.config.enable_int8:
+            try:
+                import modelopt.torch.quantization as mtq
+                logger.info("Finalizing INT8 quantization (disabling quantizers)...")
+                # Disable all quantizers on the actual UNet - this folds them into weights
+                # and removes dynamic callbacks, making the model torch.compile-friendly
+                # The wildcard "*" matches all quantizers
+                mtq.disable_quantizer(self._unet, "*")
+                logger.info("Quantization finalized - quantizers folded into weights")
+            except Exception as e:
+                logger.warning(f"Failed to finalize quantization: {e}. Trying without finalization.")
+        
         # For SDXL, added_cond_kwargs must be passed as keyword args to the UNet.
         # torch.export requires a flat positional signature, so we wrap the UNet.
         if is_sdxl:
@@ -641,20 +657,6 @@ class OptimizedPipeline:
         else:
             sample_inputs = [sample_latents, sample_timestep, sample_encoder_hidden]
             compile_model = self._unet
-        
-        # CRITICAL: Finalize quantization before TensorRT compilation.
-        # Modelopt-quantized models have _FoldedCallback objects that TorchDynamo
-        # cannot trace. We must disable quantizers to fold them into weights.
-        if self.config.enable_int8:
-            try:
-                import modelopt.torch.quantization as mtq
-                logger.info("Finalizing INT8 quantization (disabling quantizers)...")
-                # Disable all quantizers - this folds them into weights and removes
-                # dynamic callbacks, making the model torch.compile-friendly
-                mtq.disable_quantizer(compile_model)
-                logger.info("Quantization finalized - quantizers folded into weights")
-            except Exception as e:
-                logger.warning(f"Failed to finalize quantization: {e}. Trying without finalization.")
         
         # Create builder and compile
         builder = TensorRTBuilder(trt_config)
