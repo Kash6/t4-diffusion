@@ -96,10 +96,11 @@ class CalibrationConfig:
     
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
-        # Requirement 2.1: Generate at least 100 samples
-        if self.num_samples < 100:
+        # Require at least 8 samples. Diffusion INT8 PTQ works well with
+        # 32-128 samples (per NVIDIA's SDXL recipe); 8 is a safe floor.
+        if self.num_samples < 8:
             raise ValueError(
-                f"num_samples must be at least 100 for adequate calibration, "
+                f"num_samples must be at least 8 for adequate calibration, "
                 f"got {self.num_samples}"
             )
         

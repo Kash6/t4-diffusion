@@ -130,6 +130,7 @@ def get_preset(preset_name: str) -> PipelineConfig:
     return PipelineConfig(
         model_id=preset.model_id,
         enable_int8=True,
+        backend="quanto",
         enable_caching=True,
         num_inference_steps=preset.num_inference_steps,
         guidance_scale=preset.guidance_scale,

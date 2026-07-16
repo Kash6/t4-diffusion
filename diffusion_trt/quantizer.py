@@ -267,6 +267,17 @@ class INT8Quantizer:
             
             raise
         
+        # Apply layer exclusions post-quantization for modelopt 0.45+ where
+        # the config-based exclusion path isn't available.
+        post_excludes = getattr(self, "_post_quantize_excludes", None)
+        if post_excludes:
+            try:
+                for pattern in post_excludes:
+                    mtq.disable_quantizer(quantized_model, f"*{pattern}*")
+                logger.info(f"Applied {len(post_excludes)} post-quantization exclusions")
+            except Exception as e:
+                logger.warning(f"Could not apply post-quantization exclusions: {e}")
+        
         self._quantized_model = quantized_model
         
         logger.info("INT8 quantization complete")
@@ -303,13 +314,25 @@ class INT8Quantizer:
         import copy
         quant_cfg = copy.deepcopy(base_cfg)
         
-        # Disable quantization for excluded layers using the correct modelopt API:
-        # Set {"enable": False} for each pattern - this disables ALL quantizers
-        # (input, weight, output) for any layer whose name contains the pattern.
-        for pattern in exclude_layers:
-            # The key format "*<pattern>*" matches any layer name containing the pattern
-            quant_cfg["quant_cfg"][f"*{pattern}*"] = {"enable": False}
-            logger.debug(f"Disabling quantization for layers matching: *{pattern}*")
+        # Disable quantization for excluded layers. The structure of
+        # quant_cfg["quant_cfg"] varies across modelopt versions:
+        # - dict (older): map pattern -> {"enable": False}
+        # - list (0.45+): list of (pattern, config) or config entries
+        inner = quant_cfg.get("quant_cfg") if isinstance(quant_cfg, dict) else None
+        
+        if isinstance(inner, dict):
+            for pattern in exclude_layers:
+                inner[f"*{pattern}*"] = {"enable": False}
+                logger.debug(f"Disabling quantization for layers matching: *{pattern}*")
+        else:
+            # modelopt 0.45+ uses a different structure — use the public
+            # set_quantizer_attribute API instead of mutating the config dict.
+            logger.info(
+                f"quant_cfg['quant_cfg'] is {type(inner).__name__}, not dict. "
+                f"Exclusions will be applied post-quantization via disable_quantizer."
+            )
+            # Store excludes to apply after mtq.quantize
+            self._post_quantize_excludes = list(exclude_layers)
         
         logger.info(
             f"Created diffusion quant config with {len(exclude_layers)} exclusion patterns"

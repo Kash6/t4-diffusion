@@ -63,6 +63,7 @@ def generate_images():
     config = PipelineConfig(
         model_id="stabilityai/sdxl-turbo",
         enable_int8=True,
+        backend="quanto",  # Default backend, memory-safe on free-tier Colab
         enable_caching=True,
         num_inference_steps=4,
         guidance_scale=0.0,
@@ -71,6 +72,7 @@ def generate_images():
     
     print(f"  Model: {config.model_id}")
     print(f"  INT8 Quantization: {config.enable_int8}")
+    print(f"  Backend: {config.backend}")
     print(f"  Feature Caching: {config.enable_caching}")
     print(f"  Inference Steps: {config.num_inference_steps}")
     
@@ -127,15 +129,21 @@ def generate_images():
     print(f"  ├─ Peak VRAM: {metrics.vram_peak_gb:.2f} GB")
     print(f"  └─ Cache Hit Rate: {metrics.cache_hit_rate:.1%}")
     
-    print("\n" + "="*60)
-    print("STEP 5: Save Engine for Faster Loading")
-    print("="*60)
-    
-    engine_path = "optimized_engine.pt"
-    pipeline.save_engine(engine_path)
-    print(f"  ✓ Engine saved to: {engine_path}")
-    print(f"  ✓ Next time, use OptimizedPipeline.load_engine('{engine_path}')")
-    print(f"    to skip the optimization step!")
+    # save_engine()/load_engine() only apply to the opt-in "tensorrt"
+    # backend, which produces a serializable TRT engine artifact. The
+    # default "quanto" backend quantizes the UNet weights in place — there's
+    # no separate engine to save, so from_pretrained() is already fast on
+    # repeat runs (model weights are disk-cached by HuggingFace Hub).
+    if config.backend == "tensorrt":
+        print("\n" + "="*60)
+        print("STEP 5: Save Engine for Faster Loading")
+        print("="*60)
+        
+        engine_path = "optimized_engine.pt"
+        pipeline.save_engine(engine_path)
+        print(f"  ✓ Engine saved to: {engine_path}")
+        print(f"  ✓ Next time, use OptimizedPipeline.load_engine('{engine_path}')")
+        print(f"    to skip the optimization step!")
     
     print("\n" + "="*60)
     print("✓ COMPLETE!")

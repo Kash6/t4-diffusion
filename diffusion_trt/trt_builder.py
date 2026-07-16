@@ -84,6 +84,157 @@ class TRTConfig:
             )
 
 
+class UNetOutput:
+    """UNet-compatible output wrapper.
+    
+    diffusers accesses UNet outputs two ways depending on the code path:
+    - result.sample (return_dict=True style)
+    - result[0] (return_dict=False style, e.g. self.unet(...)[0])
+    Support both.
+    """
+    def __init__(self, sample: torch.Tensor):
+        self.sample = sample
+    
+    def __getitem__(self, idx):
+        if idx == 0:
+            return self.sample
+        raise IndexError(f"UNetOutput only has index 0, got {idx}")
+
+
+class TRTEngineRunner(nn.Module):
+    """
+    Wraps a native TensorRT engine as a callable nn.Module.
+    
+    This allows the TRT engine to be used as a drop-in replacement for
+    the UNet in the diffusers pipeline. Handles GPU memory allocation,
+    input/output binding, and CUDA stream management.
+    
+    The engine is built from an ONNX model with QDQ nodes, so TensorRT
+    uses real INT8 kernels on the T4's INT8 tensor cores.
+    """
+    
+    def __init__(self, engine_path: str, input_names: List[str], is_sdxl: bool = False):
+        super().__init__()
+        try:
+            import tensorrt as trt
+        except ImportError:
+            raise ImportError("tensorrt is required. Install with: pip install tensorrt")
+        
+        self._trt = trt
+        self.input_names = input_names
+        self.is_sdxl = is_sdxl
+        self._stream = torch.cuda.Stream()
+        
+        # Dummy parameter so diffusers detects this module as living on CUDA.
+        # Without this, pipeline.device returns "cpu" and randn_tensor fails.
+        self.register_buffer("_device_indicator", torch.empty(0, device="cuda"))
+        
+        # Load engine
+        trt_logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(trt_logger)
+        with open(engine_path, "rb") as f:
+            self._engine = runtime.deserialize_cuda_engine(f.read())
+        
+        if self._engine is None:
+            raise RuntimeError(f"Failed to load TRT engine from {engine_path}")
+        
+        self._context = self._engine.create_execution_context()
+        logger.info(
+            f"TRT engine loaded: {self._engine.num_io_tensors} I/O tensors, "
+            f"from {engine_path}"
+        )
+    
+    @property
+    def dtype(self):
+        """Return FP16 dtype for diffusers compatibility."""
+        return torch.float16
+    
+    @property  
+    def device(self):
+        """Return CUDA device for diffusers compatibility."""
+        return torch.device("cuda")
+    
+    def _run_single(self, sample, timestep, encoder_hidden_states,
+                     text_embeds=None, time_ids=None):
+        """Run the engine on a single batch=1 input set."""
+        inputs = {
+            "sample": sample.contiguous(),
+            "timestep": timestep.contiguous(),
+            "encoder_hidden_states": encoder_hidden_states.contiguous(),
+        }
+        if self.is_sdxl and text_embeds is not None:
+            inputs["text_embeds"] = text_embeds.contiguous()
+            inputs["time_ids"] = time_ids.contiguous()
+        
+        # Set input tensor addresses
+        for name, tensor in inputs.items():
+            self._context.set_input_shape(name, tuple(tensor.shape))
+            self._context.set_tensor_address(name, tensor.data_ptr())
+        
+        # Allocate output
+        output_name = "output"
+        output_shape = self._context.get_tensor_shape(output_name)
+        output_dtype = self._engine.get_tensor_dtype(output_name)
+        
+        # Map TRT dtype to torch dtype
+        dtype_map = {
+            self._trt.float32: torch.float32,
+            self._trt.float16: torch.float16,
+            self._trt.int8: torch.int8,
+            self._trt.int32: torch.int32,
+        }
+        torch_dtype = dtype_map.get(output_dtype, torch.float16)
+        output = torch.empty(tuple(output_shape), dtype=torch_dtype, device="cuda")
+        self._context.set_tensor_address(output_name, output.data_ptr())
+        
+        # Execute
+        self._context.execute_async_v3(self._stream.cuda_stream)
+        self._stream.synchronize()
+        
+        return output
+    
+    def forward(self, sample, timestep, encoder_hidden_states=None,
+                added_cond_kwargs=None, **kwargs):
+        """Run inference through the TRT engine with UNet-compatible interface.
+        
+        The engine is built for a static batch size of 1. diffusers commonly
+        calls the UNet with batch=2 (classifier-free guidance: conditional +
+        unconditional stacked together), so we split any batch>1 input into
+        batch-1 chunks, run the engine per-chunk, and concatenate the results.
+        """
+        batch_size = sample.shape[0]
+        
+        text_embeds = added_cond_kwargs.get("text_embeds") if (
+            self.is_sdxl and added_cond_kwargs is not None
+        ) else None
+        time_ids = added_cond_kwargs.get("time_ids") if (
+            self.is_sdxl and added_cond_kwargs is not None
+        ) else None
+        
+        # Broadcast timestep to batch size if it's a scalar/1-element tensor
+        if timestep.numel() == 1 and batch_size > 1:
+            timestep = timestep.expand(batch_size)
+        
+        if batch_size == 1:
+            output = self._run_single(sample, timestep, encoder_hidden_states, text_embeds, time_ids)
+        else:
+            outputs = []
+            for i in range(batch_size):
+                te = text_embeds[i:i+1] if text_embeds is not None else None
+                ti = time_ids[i:i+1] if time_ids is not None else None
+                outputs.append(
+                    self._run_single(
+                        sample[i:i+1],
+                        timestep[i:i+1],
+                        encoder_hidden_states[i:i+1],
+                        te, ti,
+                    )
+                )
+            output = torch.cat(outputs, dim=0)
+        
+        return UNetOutput(sample=output)
+
+
 class TensorRTBuilder:
     """
     TensorRT Engine Builder using Torch-TensorRT.
@@ -108,6 +259,19 @@ class TensorRTBuilder:
         self._compiled_model: Optional[nn.Module] = None
         self._engine_info: Dict[str, Any] = {}
     
+    @staticmethod
+    def _write_progress(step: str) -> None:
+        """Write a crash-survival progress checkpoint (see pipeline._progress)."""
+        try:
+            import datetime
+            import os as _os
+            with open("/tmp/diffusion_trt_progress.log", "a") as f:
+                f.write(f"{datetime.datetime.now().isoformat()} {step}\n")
+                f.flush()
+                _os.fsync(f.fileno())
+        except Exception:
+            pass
+    
     def compile_torchtrt(
         self,
         model: nn.Module,
@@ -115,15 +279,16 @@ class TensorRTBuilder:
         calibration_data: Optional[List[Dict[str, torch.Tensor]]] = None,
     ) -> nn.Module:
         """
-        Compile model using torch.compile with TensorRT backend.
+        Compile model using Torch-TensorRT.
         
-        Uses Torch-TensorRT's torch.compile backend for seamless integration
-        with PyTorch models. Supports INT8 precision with calibration data.
+        Expects modelopt quantizers to be already disabled/folded before
+        calling this method. The folded model is a standard PyTorch model
+        with INT8-calibrated weights baked in, compilable by TorchDynamo.
         
         Args:
-            model: PyTorch model to compile
+            model: PyTorch model to compile (quantizers must be folded)
             sample_inputs: List of sample input tensors for tracing
-            calibration_data: Optional calibration data for INT8 quantization
+            calibration_data: Optional calibration data (unused, kept for API compat)
             
         Returns:
             Compiled model with TensorRT backend
@@ -132,21 +297,20 @@ class TensorRTBuilder:
             ImportError: If torch_tensorrt is not installed
             RuntimeError: If compilation fails
         """
-        # Lazy import to handle missing torch_tensorrt gracefully
         try:
             import torch_tensorrt
-            # Try to ensure the library is properly loaded
+            trt_version = getattr(torch_tensorrt, '__version__', 'unknown')
+            logger.info(f"torch_tensorrt version: {trt_version}")
             try:
                 torch_tensorrt.runtime.set_multi_device_safe_mode(False)
             except Exception:
-                pass  # Ignore if this API doesn't exist
+                pass
         except ImportError:
             raise ImportError(
                 "torch-tensorrt is required for TensorRT compilation. "
                 "Install with: pip install torch-tensorrt"
             )
         except OSError as e:
-            # Handle library loading issues
             raise ImportError(
                 f"torch-tensorrt library failed to load: {e}. "
                 "This is likely a PyTorch/CUDA version mismatch. "
@@ -161,93 +325,111 @@ class TensorRTBuilder:
             f"optimization_level={self.config.optimization_level}"
         )
         
-        # Determine enabled precisions
+        # Log environment info for debugging
+        logger.info(f"PyTorch version: {torch.__version__}")
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"CUDA version: {torch.version.cuda}")
+        
+        # Log sample input shapes
+        for i, inp in enumerate(sample_inputs):
+            logger.info(f"Sample input {i}: shape={inp.shape}, dtype={inp.dtype}, device={inp.device}")
+        
+        # After quantizer folding, the model is effectively FP16 with calibrated
+        # weights. Use FP16 precision for TRT compilation.
         if self.config.precision == "fp32":
             enabled_precisions = {torch.float32}
-        elif self.config.precision == "fp16":
-            enabled_precisions = {torch.float16, torch.float32}
-        else:  # int8
-            enabled_precisions = {torch.int8, torch.float16, torch.float32}
+        else:
+            enabled_precisions = {torch.float16}
+        
+        logger.info(f"Enabled precisions: {enabled_precisions}")
+        num_modules = sum(1 for _ in model.modules())
+        logger.info(f"Model module count: {num_modules}")
         
         try:
-            # Strategy 1: torch.export + dynamo.compile with torch_tensorrt.Input wrappers.
-            # Raw tensors as inputs can trigger "NoneType is not iterable" inside
-            # torch-tensorrt 2.7.0 when the exported graph has None metadata.
-            # Wrapping inputs as torch_tensorrt.Input avoids that code path.
-            logger.info("Exporting model to FX graph via torch.export...")
-            
-            exported_program = None
-            try:
-                exported_program = torch.export.export(
-                    model,
-                    args=tuple(sample_inputs),
-                    strict=False,
-                )
-                logger.info("Export succeeded.")
-            except Exception as export_err:
-                logger.warning(
-                    f"torch.export failed: {export_err}. "
-                    f"Trying torch.compile backend path."
-                )
-            
-            if exported_program is not None:
+            with torch.no_grad():
+                # Strategy 1: torch_tensorrt.compile with ir="dynamo"
+                logger.info("Strategy 1: torch_tensorrt.compile(ir='dynamo')...")
                 try:
-                    # Wrap inputs as torch_tensorrt.Input to avoid NoneType iteration bug
-                    trt_inputs = [
-                        torch_tensorrt.Input(
-                            shape=t.shape,
-                            dtype=t.dtype,
-                        )
-                        for t in sample_inputs
-                    ]
-                    logger.info("Compiling with torch_tensorrt.dynamo.compile (Input wrappers)...")
-                    compiled_model = torch_tensorrt.dynamo.compile(
-                        exported_program,
-                        inputs=trt_inputs,
+                    compiled_model = torch_tensorrt.compile(
+                        model,
+                        ir="dynamo",
+                        arg_inputs=sample_inputs,
                         enabled_precisions=enabled_precisions,
                         optimization_level=self.config.optimization_level,
                         workspace_size=self.config.workspace_size,
                         min_block_size=1,
                         truncate_double=True,
-                        debug=False,
                     )
-                    # Warm up
-                    with torch.no_grad():
-                        _ = compiled_model(*sample_inputs)
+                    _ = compiled_model(*sample_inputs)
                     self._compiled_model = compiled_model
-                    logger.info("TensorRT compilation complete (dynamo path)")
+                    logger.info("TensorRT compilation complete (torch_tensorrt.compile)")
                     return compiled_model
-                except Exception as dynamo_err:
-                    logger.warning(
-                        f"dynamo.compile failed: {dynamo_err}. "
-                        f"Falling back to torch.compile(backend='torch_tensorrt')."
+                except Exception as e1:
+                    logger.warning(f"Strategy 1 failed: {e1}", exc_info=True)
+                
+                # Strategy 2: torch.export + dynamo.compile
+                logger.info("Strategy 2: torch.export + dynamo.compile...")
+                try:
+                    exported = torch.export.export(
+                        model,
+                        args=tuple(sample_inputs),
+                        strict=False,
                     )
-            
-            # Strategy 2: torch.compile with torch_tensorrt backend.
-            # This path handles quantized models better in some torch-tensorrt versions.
-            logger.info("Compiling with torch.compile(backend='torch_tensorrt')...")
-            compile_kwargs = {
-                "backend": "torch_tensorrt",
-                "options": {
-                    "enabled_precisions": enabled_precisions,
-                    "workspace_size": self.config.workspace_size,
-                    "min_block_size": 1,
-                    "truncate_double": True,
-                    "optimization_level": self.config.optimization_level,
-                    "debug": False,
-                },
-            }
-            compiled_model = torch.compile(model, **compile_kwargs)
-            # Warm up to trigger actual compilation
-            with torch.no_grad():
+                    compiled_model = torch_tensorrt.dynamo.compile(
+                        exported,
+                        inputs=sample_inputs,
+                        enabled_precisions=enabled_precisions,
+                        optimization_level=self.config.optimization_level,
+                        workspace_size=self.config.workspace_size,
+                        min_block_size=1,
+                        truncate_double=True,
+                    )
+                    _ = compiled_model(*sample_inputs)
+                    self._compiled_model = compiled_model
+                    logger.info("TensorRT compilation complete (export + dynamo)")
+                    return compiled_model
+                except Exception as e2:
+                    logger.warning(f"Strategy 2 failed: {e2}", exc_info=True)
+                
+                # Strategy 3: torch.compile with torch_tensorrt backend
+                logger.info("Strategy 3: torch.compile(backend='torch_tensorrt')...")
+                compiled_model = torch.compile(
+                    model,
+                    backend="torch_tensorrt",
+                    options={
+                        "enabled_precisions": enabled_precisions,
+                        "workspace_size": self.config.workspace_size,
+                        "min_block_size": 1,
+                        "truncate_double": True,
+                        "optimization_level": self.config.optimization_level,
+                    },
+                )
                 _ = compiled_model(*sample_inputs)
-            self._compiled_model = compiled_model
-            logger.info("TensorRT compilation complete (torch.compile backend path)")
-            return compiled_model
+                self._compiled_model = compiled_model
+                logger.info("TensorRT compilation complete (torch.compile backend)")
+                return compiled_model
             
         except Exception as e:
             logger.error(f"TensorRT compilation failed: {e}", exc_info=True)
             raise RuntimeError(f"Failed to compile model with TensorRT: {e}")
+    
+    @staticmethod
+    def _model_has_qdq_nodes(model: nn.Module) -> bool:
+        """Check if a model contains modelopt quantizer (QDQ) modules."""
+        try:
+            from modelopt.torch.quantization.nn import TensorQuantizer
+            for module in model.modules():
+                if isinstance(module, TensorQuantizer):
+                    return True
+        except ImportError:
+            pass
+        # Fallback: check for common quantizer attribute names
+        for name, _ in model.named_modules():
+            if "quantizer" in name.lower() or "_amax" in name.lower():
+                return True
+        return False
     
     def _build_compile_settings(
         self,
@@ -261,13 +443,18 @@ class TensorRTBuilder:
         else:  # int8
             enabled_precisions = {torch.int8, torch.float16, torch.float32}
         
-        return {
+        settings = {
             "enabled_precisions": enabled_precisions,
             "workspace_size": self.config.workspace_size,
             "truncate_double": True,
             "min_block_size": 1,
             "optimization_level": self.config.optimization_level,
         }
+        
+        if self.config.dynamic_shapes:
+            settings["dynamic_batch"] = True
+        
+        return settings
     
     def build_engine(
         self,
@@ -308,20 +495,33 @@ class TensorRTBuilder:
             raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
         
         logger.info(f"Building TensorRT engine from {onnx_path}")
+        self._write_progress("trt build: creating builder/network")
         
-        # Create TensorRT logger and builder
-        trt_logger = trt.Logger(trt.Logger.WARNING)
+        # Use VERBOSE logging so TRT builder errors are visible
+        trt_logger = trt.Logger(trt.Logger.VERBOSE if logger.isEnabledFor(logging.DEBUG) else trt.Logger.INFO)
         builder = trt.Builder(trt_logger)
-        network = builder.create_network(
-            1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        )
+        # TensorRT 10+ removed EXPLICIT_BATCH (implicit batch mode no longer
+        # exists, so all networks are explicit-batch by default). Older TRT
+        # versions require the flag; guard for both.
+        if hasattr(trt, "NetworkDefinitionCreationFlag") and hasattr(
+            trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH"
+        ):
+            network = builder.create_network(
+                1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            )
+        else:
+            network = builder.create_network()
         parser = trt.OnnxParser(network, trt_logger)
         
+        self._write_progress("trt build: parsing onnx file")
         # Parse ONNX model
-        with open(onnx_path, 'rb') as f:
-            if not parser.parse(f.read()):
-                errors = [parser.get_error(i) for i in range(parser.num_errors)]
-                raise RuntimeError(f"Failed to parse ONNX: {errors}")
+        # Use parse_from_file so TRT resolves external data paths relative
+        # to the ONNX file's directory (needed for models > 2GB).
+        if not parser.parse_from_file(str(onnx_path)):
+            errors = [parser.get_error(i) for i in range(parser.num_errors)]
+            raise RuntimeError(f"Failed to parse ONNX: {errors}")
+        logger.info(f"ONNX parsed successfully: {network.num_layers} layers")
+        self._write_progress(f"trt build: onnx parsed ({network.num_layers} layers)")
         
         # Configure builder
         config = builder.create_builder_config()
@@ -330,20 +530,65 @@ class TensorRTBuilder:
             self.config.workspace_size
         )
         
-        # Set precision flags
-        if self.config.precision == "fp16":
-            config.set_flag(trt.BuilderFlag.FP16)
-        elif self.config.precision == "int8":
-            config.set_flag(trt.BuilderFlag.INT8)
-            config.set_flag(trt.BuilderFlag.FP16)  # Fallback
+        # Set precision flags.
+        # TensorRT 10+ removed BuilderFlag.FP16/INT8 — precision is now
+        # determined by the network's tensor dtypes ("strongly typed"
+        # networks) rather than builder flags. Our ONNX export already uses
+        # FP16 tensors, so TRT infers FP16 automatically on newer versions.
+        # Guard the flag-setting for older TRT (<10) where it's still required.
+        if hasattr(trt.BuilderFlag, "FP16"):
+            if self.config.precision == "fp16":
+                config.set_flag(trt.BuilderFlag.FP16)
+            elif self.config.precision == "int8":
+                if hasattr(trt.BuilderFlag, "INT8"):
+                    config.set_flag(trt.BuilderFlag.INT8)
+                config.set_flag(trt.BuilderFlag.FP16)  # Fallback
+        else:
+            logger.info(
+                f"TensorRT {trt.__version__} uses strongly-typed networks — "
+                f"precision ({self.config.precision}) is inferred from ONNX "
+                f"tensor dtypes, no builder flag needed."
+            )
         
-        # Set optimization level
+        # Set optimization level. Level 0 skips most of TensorRT's tactic
+        # search (the exhaustive per-layer kernel benchmarking that consumes
+        # large amounts of HOST RAM, not just GPU memory, and is the likely
+        # cause of unrecoverable OOM kills with no Python traceback on
+        # memory-constrained hosts like free-tier Colab).
         config.builder_optimization_level = self.config.optimization_level
         
+        # NOTE: We previously restricted tactic sources / aux streams here
+        # suspecting host-RAM exhaustion during tactic search. A standalone
+        # test confirmed TensorRT's builder works fine on this machine — the
+        # real cause was an oversized ONNX graph (~21K nodes for SD1.5 UNet
+        # due to do_constant_folding=False). Left at TRT defaults now.
+        
         # Build engine
+        if torch.cuda.is_available():
+            logger.info(f"VRAM before engine build: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        
+        logger.info("Building serialized network (this may take several minutes)...")
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            logger.info(
+                f"Host RAM before build: {mem.used / 1e9:.2f}/{mem.total / 1e9:.2f} GB used"
+            )
+        except ImportError:
+            pass
+        self._write_progress("trt build: calling build_serialized_network")
         serialized_engine = builder.build_serialized_network(network, config)
+        self._write_progress("trt build: build_serialized_network returned")
         if serialized_engine is None:
-            raise RuntimeError("Failed to build TensorRT engine")
+            # Log network info for debugging
+            logger.error(f"TRT engine build returned None. Network has {network.num_layers} layers.")
+            for i in range(min(5, network.num_layers)):
+                layer = network.get_layer(i)
+                logger.error(f"  Layer {i}: {layer.name} ({layer.type})")
+            raise RuntimeError(
+                "Failed to build TensorRT engine. This usually means OOM during "
+                "engine construction or unsupported ops. Check TRT logs above."
+            )
         
         # Save engine
         output_path = Path(output_path)

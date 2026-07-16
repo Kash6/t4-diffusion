@@ -1,17 +1,60 @@
 # t4-diffusion
 
-TensorRT-optimized Stable Diffusion for NVIDIA T4 GPUs on Google Colab's free tier.
+INT8-optimized Stable Diffusion for NVIDIA T4 GPUs on Google Colab's free tier.
 
-Provides INT8 quantization, TensorRT compilation, feature caching, and VRAM monitoring. Designed to achieve 1.5-2x speedup while staying within the 15.6GB VRAM constraint of T4 GPUs.
+Provides INT8 quantization, feature caching, and VRAM monitoring, with an
+easy-to-use API compatible with HuggingFace `diffusers`. Two INT8 backends are
+available depending on how much host RAM you have to work with — see
+[Backends](#backends) below.
 
 ## Features
 
-- **INT8 Quantization** via nvidia-modelopt with SmoothQuant algorithm
-- **TensorRT Compilation** for optimized inference
+- **INT8 Quantization** — two interchangeable backends (Quanto and TensorRT), see below
 - **Feature Caching** for additional acceleration
 - **VRAM Monitoring** with 15.6GB T4 limit enforcement
 - **Property-Based Testing** for correctness guarantees
 - **Easy-to-use API** compatible with HuggingFace diffusers
+
+## Backends
+
+This project supports two INT8 backends. They trade off differently between
+memory safety and speedup, and the right choice depends on how much **host
+RAM** (not VRAM) you have available — this is the actual constraint on free
+Colab, not GPU compute or GPU memory.
+
+| | `quanto` (default) | `tensorrt` (opt-in) |
+|---|---|---|
+| Library | [optimum-quanto](https://github.com/huggingface/optimum-quanto) | nvidia-modelopt + TensorRT |
+| How it works | Quantizes + freezes UNet weights in-place, pure PyTorch ops | ONNX export → native TensorRT INT8 engine build |
+| Extra host RAM needed | ~0.1-1GB | **+4GB or more** during ONNX export alone |
+| Works on free Colab (~12GB RAM)? | Yes | Not reliably — see below |
+| Speedup vs FP16 | Modest (weight memory savings; compute may fall back to dequantize+FP16 depending on kernel support) | Larger (real INT8 tensor-core kernels), but only where it can build |
+| Best for | Free-tier Colab, laptops, any RAM-constrained box | Colab Pro, local GPUs with 16GB+ system RAM |
+
+**Why `quanto` is the default:** the free-tier Colab T4 has plenty of VRAM
+(15.6GB) but only about 12GB of *host* RAM. The TensorRT path's ONNX export
+step alone can spike host RAM usage by 4GB or more on top of a 7-8GB pipeline
+baseline — that reliably exceeds Colab's ceiling and crashes the kernel with
+no traceback. Quanto quantizes the UNet in-place with no export or engine-build
+step, so there's no tracing/serialization phase to spike during. It was
+verified working end-to-end on a free-tier-equivalent local test (see
+Verification below).
+
+**Why `tensorrt` is still here:** it gives a real, larger speedup and was
+verified working end-to-end on a local RTX 5080 (SD1.5: ~500ms/20 steps,
+~2 img/s, 1.8GB engine). If you have more host RAM to spare — Colab Pro's
+higher-RAM runtimes, or a local/cloud GPU box — it's worth using. Set
+`backend="tensorrt"` explicitly to opt in.
+
+```python
+from diffusion_trt import OptimizedPipeline, PipelineConfig
+
+# Default: safe on free-tier Colab
+config = PipelineConfig(model_id="stabilityai/sdxl-turbo", backend="quanto")
+
+# Opt-in: better speedup, needs more host RAM (Colab Pro / local GPU)
+config = PipelineConfig(model_id="stabilityai/sdxl-turbo", backend="tensorrt")
+```
 
 ## Supported Models
 
@@ -20,33 +63,43 @@ Provides INT8 quantization, TensorRT compilation, feature caching, and VRAM moni
 
 ## Target Hardware
 
-- NVIDIA T4 GPU (sm_75, 15.6GB VRAM)
-- Google Colab Free Tier
+- NVIDIA T4 GPU (sm_75, 15.6GB VRAM), Google Colab Free Tier — `quanto` backend
+- Any CUDA GPU with more host RAM headroom (Colab Pro, local GPUs) — `tensorrt` backend also viable
 
 ## Installation
 
-### Google Colab (CUDA 13.x)
+### Google Colab (free tier, default `quanto` backend)
 
 ```bash
-# Install CUDA 13 compatible TensorRT packages
-pip install tensorrt-cu13 tensorrt-lean-cu13
-
-# Install torch-tensorrt for TensorRT compilation
-pip install torch-tensorrt
-
-# Install nvidia-modelopt 0.39+ for CUDA 13
-pip install nvidia-modelopt>=0.39.0
-
-# Install t4-diffusion
 pip install git+https://github.com/Kash6/t4-diffusion.git
 ```
 
-### Local Development (CUDA 12.x)
+`optimum-quanto` is a core dependency and installs automatically. No
+TensorRT/ONNX packages are needed for the default backend.
+
+### Opt-in TensorRT backend (Colab Pro / local GPU with more host RAM)
+
+```bash
+# Install t4-diffusion with the tensorrt extra
+pip install "git+https://github.com/Kash6/t4-diffusion.git#egg=diffusion-trt[tensorrt]"
+
+# Plus TensorRT + ONNX packages (versions drift across Colab sessions —
+# install without pinning exact torch/torchvision versions):
+pip install tensorrt tensorrt-lean onnx onnxscript
+```
+
+Do **not** pin `torch`/`torchvision` versions when installing on Colab — the
+shipped versions change per session and pinning causes ABI mismatches (e.g.
+`torchvision::nms does not exist`). Pinning `transformers<4.46` and
+`diffusers<0.31` is fine and recommended for `nvidia-modelopt` compatibility.
+
+### Local Development
 
 ```bash
 git clone https://github.com/Kash6/t4-diffusion.git
 cd t4-diffusion
-pip install -e ".[dev,tensorrt-cuda12]"
+pip install -e ".[dev]"          # quanto backend (default)
+pip install -e ".[dev,tensorrt]" # + opt-in tensorrt backend
 ```
 
 ## Quick Start
@@ -56,8 +109,9 @@ from diffusion_trt import OptimizedPipeline, PipelineConfig
 
 config = PipelineConfig(
     model_id="stabilityai/sdxl-turbo",
-    enable_int8=True,           # INT8 quantization
-    enable_caching=True,        # Feature caching
+    enable_int8=True,            # INT8 quantization
+    backend="quanto",            # default; use "tensorrt" if you have the RAM for it
+    enable_caching=True,         # Feature caching
     num_inference_steps=4,
     guidance_scale=0.0,
 )
@@ -72,41 +126,53 @@ image.save("output.png")
 
 ## Performance
 
-Expected benchmarks on NVIDIA T4 (Google Colab Free Tier):
+**Measured on an actual free-tier Colab T4** (`quanto` backend, SDXL-Turbo,
+4 steps, 512x512):
 
-| Configuration | FP16 Baseline | INT8 TensorRT | Speedup |
-|--------------|---------------|---------------|---------|
-| SDXL-Turbo @ 512×512, 4 steps | ~1.5s | ~0.8-1.0s | 1.5-2x |
-| SD 1.5 @ 512×512, 20 steps | ~4.0s | ~2.5-3.0s | 1.3-1.6x |
+| Metric | Value |
+|---|---|
+| Peak VRAM (model load) | 6.62 GB |
+| Peak VRAM (inference) | 5.16 GB |
+| Latency (mean) | 2158 ms |
+| Latency (p50 / p95) | 2146 ms / 2354 ms |
+| Throughput | 0.46-0.51 img/s |
+| Available VRAM headroom | 11.34 GB (of 15.6 GB) |
 
-## Colab Notebook
+Measured locally (RTX 5080, SD1.5, 20 steps, 512x512), for comparison:
 
-Try it on Google Colab: [t4_diffusion_demo.ipynb](notebooks/t4_diffusion_demo.ipynb)
+| Backend | Latency | Throughput | Peak VRAM |
+|---|---|---|---|
+| `quanto` | ~1.1s | ~0.9 img/s | ~1.9GB |
+| `tensorrt` | ~0.5s | ~2.0 img/s | ~1.8GB (1.8GB engine) |
 
-## Roadmap
+The 5080 numbers are faster than the T4 numbers above because a 5080 has
+far more raw compute than a T4 — this is expected and not a discrepancy.
+The T4 numbers are the ones that matter for the free-tier default path;
+the local numbers are there to compare the two backends against each other
+on the same hardware. The `tensorrt` backend has not yet been re-verified
+on an actual T4 (it needs more host RAM than free-tier Colab provides — see
+above), but its host-RAM behavior is well understood and its engine build
+succeeds reliably on any machine with sufficient RAM headroom (e.g. Colab
+Pro, local/cloud GPUs).
 
-See [ROADMAP.md](ROADMAP.md) for planned features including:
+## Notebooks
 
-- **v0.2.0**: LCM-LoRA support for 2-8 step generation
-- **v0.3.0**: SDXL-Lightning support
-- **v0.4.0**: Hyper-SD support
+- **Free-tier Colab**: [t4.ipynb](notebooks/t4.ipynb) — uses the default `quanto` backend, verified working end-to-end on an actual free-tier T4.
+- **Colab Pro / enterprise / your own GPU**: [t4_pro.ipynb](notebooks/t4_pro.ipynb) — for Colab Pro, your own T4 (or better), GPU marketplace clouds, AWS SageMaker Studio Lab, or any environment with more host RAM. Defaults to the `tensorrt` backend for a larger speedup.
 
 ## Requirements
 
 - Python >= 3.10
 - CUDA-capable GPU with compute capability >= 7.5 (T4, RTX 20xx+)
 - PyTorch >= 2.1.0
+- `optimum-quanto` >= 0.2.0 (installed automatically, default backend)
 
-### For CUDA 13.x (Google Colab March 2026+)
-- tensorrt-cu13
-- tensorrt-lean-cu13
-- torch-tensorrt
-- nvidia-modelopt >= 0.39.0
-
-### For CUDA 12.x
-- tensorrt
-- torch-tensorrt >= 2.1.0
-- nvidia-modelopt >= 0.15.0
+### Only if using the opt-in `tensorrt` backend
+- tensorrt / tensorrt-lean
+- onnx, onnxscript
+- nvidia-modelopt >= 0.15.0 (CUDA 12.x) or >= 0.39.0 (CUDA 13.x)
+- Significantly more host RAM than the ~12GB free-tier Colab provides is
+  recommended — see [Backends](#backends) above.
 
 ## License
 

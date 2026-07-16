@@ -44,6 +44,9 @@ setup(
         "accelerate>=0.25.0",
         "Pillow>=9.0.0",
         "numpy>=1.24.0",
+        # Default INT8 backend. Pure PyTorch, no ONNX/TensorRT dependency,
+        # memory-safe on free-tier Colab. See README for backend tradeoffs.
+        "optimum-quanto>=0.2.0",
     ],
     extras_require={
         "dev": [
@@ -51,6 +54,9 @@ setup(
             "hypothesis>=6.0",
             "pytest-benchmark>=4.0",
         ],
+        # Opt-in TensorRT backend (PipelineConfig(backend="tensorrt")).
+        # Needs more host RAM headroom than free-tier Colab provides — see
+        # README. Not required for the default "quanto" backend.
         "tensorrt": [
             # For CUDA 13.x (Google Colab March 2026+)
             "nvidia-modelopt>=0.39.0",

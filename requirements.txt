@@ -13,7 +13,12 @@
 #   pip install torch-tensorrt --extra-index-url https://download.pytorch.org/whl/cu128
 #   pip install tensorrt nvidia-modelopt>=0.15.0
 
-# NVIDIA Model Optimizer for INT8 PTQ
+# Default INT8 backend: optimum-quanto (pure PyTorch, no ONNX/TensorRT,
+# memory-safe on free-tier Colab). See README for backend tradeoffs.
+optimum-quanto>=0.2.0
+
+# NVIDIA Model Optimizer for INT8 PTQ (only needed for the opt-in
+# "tensorrt" backend — PipelineConfig(backend="tensorrt"))
 nvidia-modelopt>=0.15.0
 
 # Diffusion model support

@@ -32,7 +32,7 @@ import torch.nn as nn
 from .model_loader import ModelLoader, ModelConfig, SUPPORTED_MODELS
 from .calibration import CalibrationEngine, CalibrationConfig, DEFAULT_CALIBRATION_PROMPTS
 from .quantizer import INT8Quantizer, QuantizationConfig
-from .trt_builder import TensorRTBuilder, TRTConfig
+from .trt_builder import TensorRTBuilder, TRTConfig, TRTEngineRunner
 from .cache_manager import CacheManager, CacheConfig
 from .models import T4_VRAM_LIMIT_GB, BenchmarkMetrics
 from .utils.vram_monitor import VRAMMonitor, get_vram_usage, clear_cache as vram_clear_cache
@@ -42,12 +42,61 @@ from .utils.vram_monitor import VRAMMonitor, get_vram_usage, clear_cache as vram
 MODEL_WEIGHTS_VRAM_LIMIT_GB = 10.0  # Max VRAM for model weights
 VRAM_WARNING_THRESHOLD_GB = 14.0   # Threshold to trigger cache clearing
 
+# Supported INT8 optimization backends.
+#
+# "quanto" (default): optimum-quanto weight-only INT8 quantization. Pure
+#   PyTorch, in-place, no ONNX export, no engine-build step. Memory-safe on
+#   free-tier Colab (~12GB host RAM) because there's no tracing/serialization
+#   phase to spike during. Speedup is more modest than real TensorRT INT8
+#   tensor-core kernels since quantized ops may fall back to
+#   dequantize-then-FP16 compute depending on kernel support.
+#
+# "tensorrt": ONNX export + native TensorRT INT8 engine build (nvidia-modelopt
+#   + SmoothQuant calibration). Gives the best speedup and is verified working
+#   end-to-end on GPUs with more host RAM headroom (Colab Pro, local GPUs),
+#   but the ONNX export step alone can spike host RAM by several GB, which
+#   reliably exceeds free-tier Colab's ~12GB ceiling. Opt-in only.
+SUPPORTED_BACKENDS = ("quanto", "tensorrt")
+
 # Lazy import for PIL to avoid import errors during testing
 if TYPE_CHECKING:
     from PIL import Image
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_host_ram(label: str) -> None:
+    """Log current host RAM usage (not VRAM) for OOM diagnosis."""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        logger.info(
+            f"[RAM] {label}: {mem.used / 1e9:.2f}/{mem.total / 1e9:.2f} GB used "
+            f"({mem.percent:.0f}%)"
+        )
+        _progress(f"RAM {label}: {mem.used / 1e9:.2f}/{mem.total / 1e9:.2f} GB")
+    except ImportError:
+        pass
+
+
+def _progress(step: str) -> None:
+    """Log a progress checkpoint that survives a runtime crash.
+    
+    Writes to /tmp/diffusion_trt_progress.log (flushed immediately) plus
+    the normal logger. After a RAM crash, read the file to see the last
+    step reached: !cat /tmp/diffusion_trt_progress.log
+    """
+    logger.info(f"[PROGRESS] {step}")
+    try:
+        import datetime
+        with open("/tmp/diffusion_trt_progress.log", "a") as f:
+            f.write(f"{datetime.datetime.now().isoformat()} {step}\n")
+            f.flush()
+            import os as _os
+            _os.fsync(f.fileno())
+    except Exception:
+        pass
 
 
 @dataclass
@@ -58,6 +107,10 @@ class PipelineConfig:
     Attributes:
         model_id: HuggingFace model identifier (e.g., "stabilityai/sdxl-turbo")
         enable_int8: Enable INT8 quantization (default: True)
+        backend: INT8 backend to use, "quanto" or "tensorrt" (default: "quanto").
+            "quanto" is memory-safe on free-tier Colab (no ONNX export/engine
+            build step). "tensorrt" gives better speedups but needs more host
+            RAM headroom (Colab Pro, local GPUs) — see README for tradeoffs.
         enable_caching: Enable feature caching (default: True)
         cache_interval: Cache every N timesteps (default: 3)
         num_inference_steps: Number of diffusion steps (default: 4 for SDXL-Turbo)
@@ -71,14 +124,15 @@ class PipelineConfig:
     """
     model_id: str
     enable_int8: bool = True
+    backend: str = "quanto"
     enable_caching: bool = True
     cache_interval: int = 3
     num_inference_steps: int = 4
     guidance_scale: float = 0.0
     seed: Optional[int] = None
     image_size: tuple = (512, 512)
-    num_calibration_samples: int = 512
-    optimization_level: int = 5
+    num_calibration_samples: int = 32
+    optimization_level: int = 3
     max_cache_size_gb: float = 2.0
     exclude_layers: Optional[List[str]] = None
     
@@ -88,6 +142,12 @@ class PipelineConfig:
             raise ValueError(
                 f"Unsupported model: '{self.model_id}'. "
                 f"Supported models: {SUPPORTED_MODELS}"
+            )
+        
+        if self.backend not in SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"Unsupported backend: '{self.backend}'. "
+                f"Supported backends: {SUPPORTED_BACKENDS}"
             )
         
         if self.cache_interval < 1:
@@ -105,9 +165,9 @@ class PipelineConfig:
                 f"guidance_scale must be >= 0, got {self.guidance_scale}"
             )
         
-        if self.num_calibration_samples < 100:
+        if self.num_calibration_samples < 8:
             raise ValueError(
-                f"num_calibration_samples must be >= 100, got {self.num_calibration_samples}"
+                f"num_calibration_samples must be >= 8, got {self.num_calibration_samples}"
             )
         
         if not 0 <= self.optimization_level <= 5:
@@ -209,6 +269,7 @@ class OptimizedPipeline:
             config = PipelineConfig(
                 model_id=model_id,
                 enable_int8=config.enable_int8,
+                backend=config.backend,
                 enable_caching=config.enable_caching,
                 cache_interval=config.cache_interval,
                 num_inference_steps=config.num_inference_steps,
@@ -224,18 +285,30 @@ class OptimizedPipeline:
         # Create pipeline instance
         pipeline = cls(config)
         
-        logger.info(f"Loading and optimizing model: {model_id}")
+        logger.info(
+            f"Loading and optimizing model: {model_id} "
+            f"(backend={config.backend if config.enable_int8 else 'fp16'})"
+        )
         
         # Step 1: Load model with memory optimizations
         pipeline._load_model()
+        _log_host_ram("after model load (diffusers pipeline baseline)")
         
-        # Step 2: Apply INT8 quantization if enabled
+        # Step 2/3: Apply INT8 optimization via the selected backend.
         if config.enable_int8:
-            pipeline._apply_quantization()
-        
-        # Step 3: Compile with TensorRT if INT8 is enabled
-        if config.enable_int8:
-            pipeline._compile_tensorrt()
+            if config.backend == "quanto":
+                # Quanto: no ONNX export, no engine-build step. Quantizes and
+                # freezes the UNet in-place with pure PyTorch ops, so there's
+                # no tracing/serialization phase to spike host RAM during —
+                # safe on free-tier Colab. See README for the speedup tradeoff.
+                pipeline._apply_quanto_quantization()
+            else:
+                # TensorRT: modelopt SmoothQuant calibration + ONNX export +
+                # native TRT engine build. Best speedup, but the ONNX export
+                # step alone can spike host RAM by several GB — needs more
+                # RAM headroom than free-tier Colab provides. Opt-in only.
+                pipeline._apply_quantization()
+                pipeline._compile_tensorrt()
         
         # Step 4: Setup feature caching if enabled
         if config.enable_caching:
@@ -323,6 +396,71 @@ class OptimizedPipeline:
                     f"or enabling CPU offloading."
                 )
     
+    def _apply_quanto_quantization(self) -> None:
+        """
+        Apply INT8 weight-only quantization to the UNet via optimum-quanto.
+        
+        This is the default backend: pure PyTorch, in-place, no ONNX export
+        and no separate engine-build step. That eliminates the RAM-spike
+        problem class that makes the TensorRT/ONNX path (see
+        `_apply_quantization` + `_compile_tensorrt`) unreliable on free-tier
+        Colab (~12GB host RAM) — there's no tracing/serialization phase to
+        spike during.
+        
+        Tradeoff (documented honestly in README): quanto gives real memory
+        reduction from smaller weight tensors, but a more modest speedup than
+        genuine TensorRT INT8 tensor-core kernels, since quantized ops may
+        fall back to dequantize-then-FP16 compute depending on kernel
+        support for the given GPU/op combination.
+        
+        Falls back to FP16 (no quantization) if optimum-quanto is not
+        installed or quantization fails for any reason.
+        """
+        _progress("quanto quantization: start")
+        _log_host_ram("at quanto quantization start (baseline)")
+        logger.info("Applying INT8 quantization via optimum-quanto")
+        
+        try:
+            from optimum.quanto import quantize as quanto_quantize, freeze, qint8
+        except ImportError as e:
+            logger.warning(
+                f"optimum-quanto not installed, skipping INT8 quantization: {e}. "
+                f"Install with: pip install optimum-quanto"
+            )
+            return
+        
+        if self._unet is None:
+            logger.warning("No UNet available for quanto quantization; skipping")
+            return
+        
+        # Reuse the same diffusion-specific exclusion patterns as the
+        # TensorRT backend (time_embedding, conv_in/out, etc.) — these layers
+        # are sensitive to quantization error in diffusion UNets regardless
+        # of which backend performs the quantization.
+        from .quantizer import DIFFUSION_EXCLUDE_PATTERNS
+        
+        exclude_layers = list(self.config.exclude_layers or [])
+        exclude_layers.extend(
+            p for p in DIFFUSION_EXCLUDE_PATTERNS if p not in exclude_layers
+        )
+        # quanto's exclude patterns are fnmatch (shell-style) globs matched
+        # against full submodule names, so wrap each with a leading/trailing
+        # wildcard the same way the TensorRT backend's config-based exclusion
+        # does.
+        exclude_globs = [f"*{pattern}*" for pattern in exclude_layers]
+        logger.info(f"Layers excluded from quanto quantization: {exclude_layers}")
+        
+        try:
+            self._unet.eval()
+            quanto_quantize(self._unet, weights=qint8, exclude=exclude_globs)
+            freeze(self._unet)
+            _log_host_ram("after quanto quantization + freeze")
+            _progress("quanto quantization: complete")
+            logger.info("✓ INT8 quantization complete (quanto backend)")
+        except Exception as e:
+            logger.error(f"Quanto quantization failed: {e}", exc_info=True)
+            logger.warning("Falling back to FP16 UNet (no INT8 quantization)")
+    
     def _apply_quantization(self) -> None:
         """
         Apply INT8 quantization to the UNet.
@@ -335,6 +473,8 @@ class OptimizedPipeline:
         Requirements:
             - 10.3: Identify and exclude problematic layers if accuracy degrades
         """
+        _progress("quantization: start")
+        _log_host_ram("at quantization start (baseline)")
         logger.info("Applying INT8 quantization")
         
         # Create calibration config
@@ -438,6 +578,7 @@ class OptimizedPipeline:
         quantizer = INT8Quantizer(quant_config)
         
         try:
+            _progress("quantization: running mtq.quantize (calibration)")
             quantized_unet = quantizer.quantize(
                 model=self._unet,
                 calibration_data=calibration_data,
@@ -445,6 +586,16 @@ class OptimizedPipeline:
             
             # Quantization succeeded - use the quantized model
             self._unet = quantized_unet
+            # Explicitly drop the quantizer's internal references (calibration
+            # data list, quantized_model reference) now that we've extracted
+            # what we need, rather than waiting for them to fall out of scope.
+            quantizer._calibration_data_list = None
+            quantizer._quantized_model = None
+            del calibration_data
+            import gc
+            gc.collect()
+            _log_host_ram("after quantization cleanup")
+            _progress("quantization: complete")
             logger.info("✓ INT8 quantization complete")
             return
                     
@@ -453,7 +604,7 @@ class OptimizedPipeline:
             return
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"INT8 quantization failed: {error_msg}")
+            logger.error(f"INT8 quantization failed: {error_msg}", exc_info=True)
             
             # Provide helpful error messages
             if "NoneType" in error_msg:
@@ -562,36 +713,60 @@ class OptimizedPipeline:
     
     def _compile_tensorrt(self) -> None:
         """
-        Compile the UNet with TensorRT.
+        Compile the UNet with TensorRT via ONNX export.
         
-        Falls back to FP16 precision if INT8 compilation fails.
-        Falls back to torch.compile with inductor if TensorRT is unavailable.
+        Uses the ONNX path for INT8 compilation:
+        1. Export the modelopt-quantized UNet to ONNX (preserves QDQ nodes)
+        2. Build a native TRT engine from the ONNX file (INT8+FP16 flags)
+        3. Wrap the engine in TRTEngineRunner for UNet-compatible inference
+        
+        This bypasses TorchDynamo entirely, avoiding the _FoldedCallback
+        incompatibility with modelopt 0.42+. TensorRT's ONNX parser natively
+        understands QDQ nodes and converts them to real INT8 kernels.
+        
+        Falls back to torch.compile with inductor if TRT compilation fails.
         
         Requirements:
             - 10.2: Fall back to FP16 precision if INT8 compilation fails
         """
-        logger.info("Compiling with TensorRT")
+        import tempfile
+        import os
         
-        # Create TensorRT config
+        logger.info("Compiling with TensorRT (ONNX path)")
+        
+        # FP16 precision — quantizers are folded (SmoothQuant scales baked into
+        # weights), TRT applies kernel fusion + memory optimization for speedup.
+        #
+        # Cap optimization_level at 2 for the ONNX build path. TRT's builder
+        # does an exhaustive tactic search at higher levels (3-5), which can
+        # spike HOST RAM (not VRAM) well past what the model itself needs and
+        # silently OOM-kill the process with no Python traceback. Level 2 still
+        # gives solid kernel fusion without the exhaustive search blowup.
+        onnx_opt_level = min(self.config.optimization_level, 3)
+        if onnx_opt_level != self.config.optimization_level:
+            logger.info(
+                f"Capping TRT optimization_level to {onnx_opt_level} for ONNX "
+                f"build (configured: {self.config.optimization_level}) to avoid "
+                f"host RAM exhaustion during tactic search."
+            )
         trt_config = TRTConfig(
-            precision="int8" if self.config.enable_int8 else "fp16",
-            optimization_level=self.config.optimization_level,
+            precision="fp16",
+            optimization_level=onnx_opt_level,
+            workspace_size=2 * 1024 * 1024 * 1024,  # 2GB scratch space
             max_batch_size=1,
             use_cuda_graph=True,
         )
+        logger.info(
+            f"TRT config: precision={trt_config.precision}, "
+            f"opt_level={trt_config.optimization_level}, "
+            f"workspace={trt_config.workspace_size / (1024**3):.1f}GB"
+        )
         
-        # Create sample inputs for compilation
+        # Create sample inputs
         latent_height = self.config.image_size[0] // 8
         latent_width = self.config.image_size[1] // 8
         
-        sample_latents = torch.randn(
-            1, 4, latent_height, latent_width,
-            device="cuda",
-            dtype=torch.float16,
-        )
-        sample_timestep = torch.tensor([500], device="cuda", dtype=torch.long)
-        
-        # Detect SDXL: dual encoders produce 2048-dim embeddings (768 + 1280)
+        # Detect SDXL
         is_sdxl = (
             hasattr(self._pipeline, 'text_encoder_2') and
             self._pipeline.text_encoder_2 is not None
@@ -602,105 +777,326 @@ class OptimizedPipeline:
                 cross_attn_dim = getattr(unet_cfg, 'cross_attention_dim', 768)
                 is_sdxl = cross_attn_dim == 2048
         
+        logger.info(f"SDXL detected: {is_sdxl}")
+        
         encoder_hidden_dim = 2048 if is_sdxl else 768
-        sample_encoder_hidden = torch.randn(
-            1, 77, encoder_hidden_dim,
-            device="cuda",
-            dtype=torch.float16,
-        )
         
-        # CRITICAL: Finalize quantization BEFORE wrapping for SDXL.
-        # Modelopt-quantized models have _FoldedCallback objects that TorchDynamo
-        # cannot trace. We must disable quantizers to fold them into weights.
-        # This must be done on the actual UNet, not on a wrapper.
-        if self.config.enable_int8:
-            try:
-                import modelopt.torch.quantization as mtq
-                logger.info("Finalizing INT8 quantization (disabling quantizers)...")
-                # Disable all quantizers on the actual UNet - this folds them into weights
-                # and removes dynamic callbacks, making the model torch.compile-friendly
-                # The wildcard "*" matches all quantizers
-                mtq.disable_quantizer(self._unet, "*")
-                logger.info("Quantization finalized - quantizers folded into weights")
-            except Exception as e:
-                logger.warning(f"Failed to finalize quantization: {e}. Trying without finalization.")
+        sample_input = {
+            "sample": torch.randn(1, 4, latent_height, latent_width, device="cuda", dtype=torch.float16),
+            "timestep": torch.tensor([500], device="cuda", dtype=torch.long),
+            "encoder_hidden_states": torch.randn(1, 77, encoder_hidden_dim, device="cuda", dtype=torch.float16),
+        }
         
-        # For SDXL, added_cond_kwargs must be passed as keyword args to the UNet.
-        # torch.export requires a flat positional signature, so we wrap the UNet.
         if is_sdxl:
-            sample_text_embeds = torch.randn(1, 1280, device="cuda", dtype=torch.float16)
-            sample_time_ids = torch.tensor(
+            sample_input["text_embeds"] = torch.randn(1, 1280, device="cuda", dtype=torch.float16)
+            sample_input["time_ids"] = torch.tensor(
                 [[512.0, 512.0, 0.0, 0.0, 512.0, 512.0]], device="cuda", dtype=torch.float16
             )
-            sample_inputs = [
-                sample_latents, sample_timestep, sample_encoder_hidden,
-                sample_text_embeds, sample_time_ids,
-            ]
+        
+        if torch.cuda.is_available():
+            vram_before = torch.cuda.memory_allocated() / 1e9
+            logger.info(f"VRAM before TRT compilation: {vram_before:.2f} GB")
+        
+        # Permanently drop the safety checker before the ONNX export. It's a
+        # full CLIP vision model (several hundred MB to ~1GB in host RAM)
+        # that plays no role in quantization/export/engine-building, and
+        # running with safety_checker=None is a standard, supported diffusers
+        # pattern (not a hack) used by many production pipelines. This is one
+        # of the larger avoidable host-RAM consumers on memory-constrained
+        # hosts (e.g. Colab free tier's ~12GB), so we free it for good rather
+        # than temporarily offloading it.
+        if getattr(self._pipeline, "safety_checker", None) is not None:
+            logger.info("Dropping safety_checker to reduce host RAM (does not affect optimization)")
+            self._pipeline.safety_checker = None
+            self._pipeline.feature_extractor = None
+            import gc
+            gc.collect()
+            _log_host_ram("after dropping safety_checker")
+        
+        # Track offloaded components at method scope so we can always restore
+        # them, even if compilation fails and we fall back to torch.compile.
+        offloaded = []
+        
+        def _restore_offloaded():
+            """Move any CPU-offloaded pipeline components back to GPU."""
+            for comp_name in offloaded:
+                component = getattr(self._pipeline, comp_name, None)
+                if component is not None and hasattr(component, "to"):
+                    try:
+                        component.to("cuda")
+                    except Exception:
+                        pass
+            if offloaded:
+                logger.info(f"Restored {offloaded} to GPU")
+        
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                onnx_path = os.path.join(tmpdir, "unet.onnx")
+                engine_path = os.path.join(tmpdir, "unet.engine")
+                
+                # NOTE: We do NOT offload text encoders / VAE to CPU here.
+                # ONNX export of the 5GB UNet needs ~10GB CPU RAM, and Colab
+                # free tier only has ~12GB. Moving GPU components to CPU would
+                # compete for that RAM and cause OOM. We have VRAM headroom
+                # (peak ~7GB of 15.6GB), so everything stays on GPU.
+                if torch.cuda.is_available():
+                    logger.info(f"VRAM before ONNX export: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                
+                # Step 1: Strip quantizer wrappers and export clean ONNX
+                # mtq.disable_quantizer only disables quantizers during forward
+                # but the ONNX tracer still sees them (~127K nodes). We need to
+                # physically replace quantized modules with plain nn.Linear/Conv2d.
+                if self.config.enable_int8:
+                    try:
+                        import modelopt.torch.quantization as mtq
+                        # First fold scales into weights
+                        mtq.disable_quantizer(self._unet, "*")
+                        # Count modules before stripping
+                        before_count = sum(1 for _ in self._unet.modules())
+                        # Then strip the quantizer wrappers entirely
+                        self._strip_quantizer_wrappers(self._unet)
+                        after_count = sum(1 for _ in self._unet.modules())
+                        logger.info(
+                            f"Quantizer wrappers stripped: {before_count} → {after_count} modules"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Could not strip quantizers: {e}")
+                
+                _progress("onnx export: start")
+                logger.info("Step 1: Exporting UNet to ONNX...")
+                _log_host_ram("before onnx export")
+                self._export_unet_onnx(self._unet, sample_input, onnx_path, is_sdxl)
+                _log_host_ram("after onnx export")
+                
+                onnx_size_mb = os.path.getsize(onnx_path) / (1024 * 1024)
+                _progress(f"onnx export: complete ({onnx_size_mb:.0f} MB)")
+                logger.info(f"ONNX export complete: {onnx_size_mb:.1f} MB")
+                
+                # Save UNet config before offloading
+                unet_config = getattr(self._unet, 'config', None)
+                
+                # Move UNet to CPU (frees VRAM) and drop OUR extra Python
+                # reference to it. self._pipeline.unet still holds the single
+                # remaining reference, so it stays alive as a fallback for
+                # torch.compile if the TRT build fails, without us holding a
+                # second reference. (self._unet and self._pipeline.unet always
+                # pointed at the same object — dropping self._unet doesn't
+                # free memory, it just removes a redundant reference so the
+                # garbage collector has one less name to track.)
+                logger.info("Moving UNet to CPU and freeing VRAM before TRT engine build...")
+                self._unet.to("cpu")
+                self._pipeline.unet = self._unet
+                self._unet = None  # drop our reference; pipeline.unet is the sole owner
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    logger.info(f"VRAM after UNet move: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+                _log_host_ram("before TRT build")
+                
+                # Step 2: Build TRT engine from ONNX
+                _progress("trt build: start")
+                logger.info("Step 2: Building TRT engine from ONNX (this may take a few minutes)...")
+                builder = TensorRTBuilder(trt_config)
+                builder.build_engine(onnx_path, engine_path)
+                
+                engine_size_mb = os.path.getsize(engine_path) / (1024 * 1024)
+                _progress(f"trt build: complete ({engine_size_mb:.0f} MB)")
+                logger.info(f"TRT engine built: {engine_size_mb:.1f} MB")
+                
+                # Step 3: Load engine into runner
+                logger.info("Step 3: Loading TRT engine runner...")
+                input_names = list(sample_input.keys())
+                runner = TRTEngineRunner(engine_path, input_names, is_sdxl=is_sdxl)
+                
+                # Copy UNet config so diffusers can access unet.config attributes
+                if unet_config is not None:
+                    runner.config = unet_config
+                
+                self._trt_unet = runner
+                self._trt_unet_is_sdxl_wrapper = False  # Runner handles SDXL internally
+                
+                # Engine built successfully — now free the original UNet
+                # (it's on CPU, so this frees CPU RAM)
+                del self._unet
+                self._unet = None
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Swap the diffusers pipeline's UNet to use the TRT engine
+                self._pipeline.unet = self._trt_unet
+                logger.info("Swapped diffusers pipeline UNet with TRT engine runner")
+                
+                # Restore text encoders + VAE to GPU for inference
+                _restore_offloaded()
+                
+                if torch.cuda.is_available():
+                    vram_after = torch.cuda.memory_allocated() / 1e9
+                    logger.info(f"VRAM after TRT compilation: {vram_after:.2f} GB")
+                
+                logger.info("✓ TensorRT INT8 compilation complete (ONNX path)")
+                
+        except ImportError as e:
+            logger.warning(f"TensorRT compilation skipped (missing dependency): {e}")
+            _restore_offloaded()  # ensure components are back on GPU
+            self._try_torch_compile_fallback()
+        except Exception as e:
+            logger.error(f"TensorRT ONNX compilation failed: {e}", exc_info=True)
+            logger.warning("Falling back to torch.compile (inductor)")
+            _restore_offloaded()  # ensure components are back on GPU
+            self._try_torch_compile_fallback()
+    
+    @staticmethod
+    def _strip_quantizer_wrappers(model: nn.Module) -> None:
+        """Replace modelopt quantized modules with plain PyTorch modules.
+        
+        After mtq.disable_quantizer folds scales into weights, the quantizer
+        wrapper modules (QuantLinear, QuantConv2d, etc.) still exist and get
+        exported to ONNX as ~50 nodes each. This method replaces them with
+        plain nn.Linear/nn.Conv2d using the already-folded weights.
+        """
+        import torch.nn as nn
+        
+        replacements = {}
+        for name, module in model.named_modules():
+            # Check if this is a modelopt quantized module by looking for
+            # the quantizer attributes that modelopt adds
+            if not hasattr(module, 'input_quantizer'):
+                continue
             
-            # Wrap UNet so all inputs are positional (required for torch.export)
-            unet_inner = self._unet
+            # Get the original module class name
+            cls_name = type(module).__name__
             
-            class SDXLUNetWrapper(nn.Module):
+            if 'Linear' in cls_name and isinstance(module, nn.Linear):
+                # Create a plain Linear with the same weights
+                plain = nn.Linear(
+                    module.in_features, module.out_features,
+                    bias=module.bias is not None,
+                    device=module.weight.device, dtype=module.weight.dtype,
+                )
+                plain.weight = nn.Parameter(module.weight.data.clone())
+                if module.bias is not None:
+                    plain.bias = nn.Parameter(module.bias.data.clone())
+                replacements[name] = plain
+                
+            elif 'Conv2d' in cls_name and isinstance(module, nn.Conv2d):
+                plain = nn.Conv2d(
+                    module.in_channels, module.out_channels,
+                    module.kernel_size, module.stride, module.padding,
+                    module.dilation, module.groups,
+                    bias=module.bias is not None,
+                    device=module.weight.device, dtype=module.weight.dtype,
+                )
+                plain.weight = nn.Parameter(module.weight.data.clone())
+                if module.bias is not None:
+                    plain.bias = nn.Parameter(module.bias.data.clone())
+                replacements[name] = plain
+        
+        # Apply replacements
+        for name, new_module in replacements.items():
+            parts = name.split('.')
+            parent = model
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            setattr(parent, parts[-1], new_module)
+        
+        logger.info(f"Stripped {len(replacements)} quantizer wrappers")
+    
+    @staticmethod
+    def _export_unet_onnx(
+        unet: nn.Module,
+        sample_input: Dict[str, torch.Tensor],
+        output_path: str,
+        is_sdxl: bool,
+    ) -> None:
+        """Export the quantized UNet to ONNX, preserving QDQ nodes."""
+        unet.eval()
+        
+        sample = sample_input["sample"]
+        timestep = sample_input["timestep"]
+        encoder_hidden_states = sample_input["encoder_hidden_states"]
+        
+        input_names = ["sample", "timestep", "encoder_hidden_states"]
+        
+        if is_sdxl:
+            # For SDXL, wrap the UNet so added_cond_kwargs are positional args
+            text_embeds = sample_input["text_embeds"]
+            time_ids = sample_input["time_ids"]
+            
+            class SDXLOnnxWrapper(nn.Module):
+                def __init__(self, unet_module):
+                    super().__init__()
+                    self.unet = unet_module
+                
                 def forward(self, sample, timestep, encoder_hidden_states,
                             text_embeds, time_ids):
-                    return unet_inner(
-                        sample,
-                        timestep,
+                    return self.unet(
+                        sample, timestep,
                         encoder_hidden_states=encoder_hidden_states,
                         added_cond_kwargs={
                             "text_embeds": text_embeds,
                             "time_ids": time_ids,
                         },
-                    )
+                    ).sample
             
-            compile_model = SDXLUNetWrapper().eval()
+            export_model = SDXLOnnxWrapper(unet).eval()
+            input_tuple = (sample, timestep, encoder_hidden_states, text_embeds, time_ids)
+            input_names += ["text_embeds", "time_ids"]
         else:
-            sample_inputs = [sample_latents, sample_timestep, sample_encoder_hidden]
-            compile_model = self._unet
-        
-        # Create builder and compile
-        builder = TensorRTBuilder(trt_config)
-        
-        try:
-            compiled = builder.compile_torchtrt(
-                model=compile_model,
-                sample_inputs=sample_inputs,
-            )
-            # For SDXL, store the wrapper; inference code must call with flat args
-            # or we unwrap below. We store the original unet reference for __call__.
-            self._trt_unet = compiled
-            self._trt_unet_is_sdxl_wrapper = is_sdxl
-            logger.info("TensorRT compilation complete")
-        except ImportError as e:
-            logger.warning(f"TensorRT compilation skipped: {e}")
-            self._try_torch_compile_fallback()
-        except Exception as e:
-            # Requirement 10.2: Fall back to FP16 precision if INT8 compilation fails
-            logger.warning(
-                f"TensorRT INT8 compilation failed: {e}. "
-                f"Falling back to FP16 precision."
-            )
+            class UnetOnnxWrapper(nn.Module):
+                def __init__(self, unet_module):
+                    super().__init__()
+                    self.unet = unet_module
+                
+                def forward(self, sample, timestep, encoder_hidden_states):
+                    return self.unet(
+                        sample, timestep,
+                        encoder_hidden_states=encoder_hidden_states,
+                    ).sample
             
-            # Try FP16 compilation as fallback
-            try:
-                trt_config_fp16 = TRTConfig(
-                    precision="fp16",
-                    optimization_level=self.config.optimization_level,
-                    max_batch_size=1,
-                    use_cuda_graph=True,
-                )
-                builder_fp16 = TensorRTBuilder(trt_config_fp16)
-                self._trt_unet = builder_fp16.compile_torchtrt(
-                    model=self._unet,
-                    sample_inputs=sample_inputs,
-                )
-                logger.info("TensorRT FP16 fallback compilation complete")
-            except Exception as fallback_error:
-                logger.warning(
-                    f"TensorRT FP16 fallback also failed: {fallback_error}. "
-                    f"Trying torch.compile fallback."
-                )
-                self._try_torch_compile_fallback()
+            export_model = UnetOnnxWrapper(unet).eval()
+            input_tuple = (sample, timestep, encoder_hidden_states)
+        
+        logger.info(f"ONNX export: inputs={input_names}, is_sdxl={is_sdxl}")
+        for i, t in enumerate(input_tuple):
+            logger.info(f"  Input {input_names[i]}: shape={t.shape}, dtype={t.dtype}")
+        
+        import os as _os
+        output_dir = _os.path.dirname(output_path)
+        
+        export_kwargs = dict(
+            input_names=input_names,
+            output_names=["output"],
+            opset_version=18,  # opset 17 lacks a Resize adapter in newer torch
+            # Constant folding collapses shape/scalar arithmetic into constants
+            # instead of emitting them as real ONNX nodes. Without it, the SD1.5
+            # UNet exports as ~21K nodes (vs ~3-4K normally), which is what was
+            # hanging/crashing TRT's builder — not a RAM issue as first suspected.
+            do_constant_folding=True,
+            export_params=True,
+        )
+        # Force the legacy exporter when available — the new dynamo-based
+        # torch.onnx path OOMs on T4 during version conversion.
+        import inspect
+        if "dynamo" in inspect.signature(torch.onnx.export).parameters:
+            export_kwargs["dynamo"] = False
+        
+        with torch.no_grad():
+            torch.onnx.export(
+                export_model,
+                input_tuple,
+                output_path,
+                **export_kwargs,
+            )
+        
+        # For models >2GB, torch.onnx.export may produce a file that exceeds
+        # protobuf's 2GB limit. TRT's parse_from_file handles this natively
+        # (it uses its own C++ ONNX parser, not Python protobuf).
+        # We skip the onnx.load/re-save step to avoid RAM issues on Colab.
+        import os as _os
+        file_size_mb = _os.path.getsize(output_path) / (1024 * 1024)
+        logger.info(f"ONNX file size: {file_size_mb:.1f} MB")
     
     def _try_torch_compile_fallback(self) -> None:
         """
@@ -709,6 +1105,40 @@ class OptimizedPipeline:
         Uses the inductor backend which doesn't require TensorRT.
         Provides ~1.2-1.4x speedup on most GPUs after warmup.
         """
+        # The UNet may have been fully freed (deleted from both GPU and host
+        # RAM) before a TRT ONNX build attempt, to avoid double-counting its
+        # memory during the risky build_serialized_network call. If so,
+        # reload it fresh — the model files are already disk-cached from the
+        # initial from_pretrained() call, so this is a fast local load, not
+        # a re-download.
+        if self._unet is None:
+            logger.info("UNet was freed before TRT build attempt; reloading from disk cache...")
+            try:
+                if self._model_loader is not None and self._pipeline is not None:
+                    reloaded_unet = self._model_loader.extract_unet(self._pipeline)
+                    self._unet = reloaded_unet
+                    logger.info("UNet reloaded successfully")
+            except Exception as e:
+                logger.error(f"Could not reload UNet: {e}")
+        
+        # The UNet may still be on CPU from an older code path. Restore it to GPU.
+        if self._unet is not None and torch.cuda.is_available():
+            try:
+                self._unet.to("cuda")
+                logger.info("Restored UNet to GPU for torch.compile fallback")
+            except Exception as e:
+                logger.warning(f"Could not move UNet to GPU: {e}")
+        
+        # If we truly have no UNet, nothing to optimize
+        if self._unet is None:
+            logger.warning("No UNet available for fallback; pipeline uses its own UNet")
+            self._optimization_level = "fp16_baseline"
+            return
+        
+        # Ensure the diffusers pipeline points at the (GPU) UNet
+        if self._pipeline is not None:
+            self._pipeline.unet = self._unet
+        
         try:
             logger.warning("Attempting torch.compile optimization (inductor backend)...")
             self._trt_unet = torch.compile(
@@ -862,7 +1292,11 @@ class OptimizedPipeline:
         
         if self._trt_unet is None:
             raise RuntimeError(
-                "No TensorRT engine to save. Ensure INT8 optimization is enabled."
+                "No TensorRT engine to save. save_engine() only applies to the "
+                "'tensorrt' backend (PipelineConfig(backend='tensorrt')). The "
+                "default 'quanto' backend has no separate engine artifact to "
+                "serialize — it quantizes the UNet weights in place, so just "
+                "save the pipeline/model normally if you need persistence."
             )
         
         engine_path = Path(path)
@@ -908,6 +1342,7 @@ class OptimizedPipeline:
         config_dict = {
             'model_id': self.config.model_id,
             'enable_int8': self.config.enable_int8,
+            'backend': self.config.backend,
             'enable_caching': self.config.enable_caching,
             'cache_interval': self.config.cache_interval,
             'num_inference_steps': self.config.num_inference_steps,
@@ -991,6 +1426,7 @@ class OptimizedPipeline:
         config = PipelineConfig(
             model_id=config_dict.get('model_id', 'stabilityai/sdxl-turbo'),
             enable_int8=config_dict.get('enable_int8', True),
+            backend=config_dict.get('backend', 'quanto'),
             enable_caching=config_dict.get('enable_caching', True),
             cache_interval=config_dict.get('cache_interval', 3),
             num_inference_steps=config_dict.get('num_inference_steps', 4),

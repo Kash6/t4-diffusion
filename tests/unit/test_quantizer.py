@@ -219,9 +219,11 @@ class TestINT8QuantizerQuantize:
                     "encoder_hidden_states": torch.randn(1, 77, 768),
                 }
         
-        # Without modelopt installed, should raise ImportError
-        with pytest.raises(ImportError, match="nvidia-modelopt is required"):
-            quantizer.quantize(mock_model, mock_calibration_data())
+        # Explicitly simulate modelopt being unavailable, regardless of
+        # whether it's actually installed in the test environment.
+        with patch.dict('sys.modules', {'modelopt.torch.quantization': None}):
+            with pytest.raises(ImportError, match="nvidia-modelopt is required"):
+                quantizer.quantize(mock_model, mock_calibration_data())
 
     @pytest.mark.unit
     def test_quantize_model_set_to_eval_before_import(self):
@@ -240,10 +242,11 @@ class TestINT8QuantizerQuantize:
                     "encoder_hidden_states": torch.randn(1, 77, 768),
                 }
         
-        # Will raise ImportError because modelopt is not installed
-        # The import happens before eval() is called, so eval won't be called
-        with pytest.raises(ImportError, match="nvidia-modelopt is required"):
-            quantizer.quantize(mock_model, mock_calibration_data())
+        # Explicitly simulate modelopt being unavailable so the ImportError
+        # path is exercised regardless of the test environment.
+        with patch.dict('sys.modules', {'modelopt.torch.quantization': None}):
+            with pytest.raises(ImportError, match="nvidia-modelopt is required"):
+                quantizer.quantize(mock_model, mock_calibration_data())
         
         # Model eval is NOT called because import fails first
         # This is expected behavior - we can't set eval mode if we can't import

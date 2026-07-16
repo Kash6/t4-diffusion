@@ -45,6 +45,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.benchmarks/
 
 # Translations
 *.mo
@@ -68,6 +69,10 @@ venv.bak/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+
+# Notebooks are run-and-uploaded manually (contain execution output/state
+# that shouldn't be committed as source) rather than tracked directly
+notebooks/*.ipynb
 
 # TensorRT engines
 *.engine
@@ -94,3 +99,6 @@ video_diffusion_cuda/
 
 # Kiro IDE files
 .kiro/
+
+# Internal debugging/handoff notes (not meant for the public repo)
+HANDOFF.md
