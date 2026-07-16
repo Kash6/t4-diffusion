@@ -55,6 +55,34 @@ host RAM to spare — Colab Pro's higher-RAM runtimes, your own GPU, or a
 cloud GPU box — it's the better choice. Set `backend="tensorrt"` explicitly
 to opt in.
 
+**Before running the `tensorrt` backend**, it's worth checking whether your
+machine has enough host RAM to survive the build:
+
+```python
+from diffusion_trt import OptimizedPipeline
+
+check = OptimizedPipeline.estimate_tensorrt_build_requirements()
+print(check["message"])
+```
+
+This won't catch every OOM (other processes can eat RAM mid-build), but it
+turns the common case of "obviously not enough RAM" into a clear message
+instead of a silent kernel kill. `from_pretrained()` runs this check
+automatically and logs a warning if requirements aren't met, but proceeds
+anyway (it doesn't hard-block, since the check itself can be wrong).
+
+**Repeat builds are cached on disk.** The first `tensorrt` build for a given
+`(model, resolution, quantization config, TensorRT version, GPU)` combination
+is saved to `~/.cache/diffusion_trt/engines/` (override with
+`DIFFUSION_TRT_ENGINE_CACHE_DIR`). A later run with an identical
+configuration on the same machine skips calibration, ONNX export, and the
+engine build entirely, and loads the cached engine directly — turning a
+build that takes ~1-2 minutes into one that takes a couple of seconds. This
+is a local cache only (not shared between machines or users): TensorRT
+engines aren't portable across GPU architectures or TensorRT versions, so a
+cache entry built on one machine won't be reused on another, and reuse
+across unrelated users' machines isn't attempted.
+
 ```python
 from diffusion_trt import OptimizedPipeline, PipelineConfig
 
