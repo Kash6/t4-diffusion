@@ -191,20 +191,23 @@ class TestTensorRTBuilderCompile:
     @pytest.mark.unit
     @patch('torch.compile')
     def test_compile_calls_torch_compile(self, mock_compile):
-        """Test that compile_torchtrt calls torch.compile."""
+        """Test that compile_torchtrt calls torch_tensorrt.compile (Strategy 1)."""
         config = TRTConfig()
         builder = TensorRTBuilder(config)
         
         mock_model = MagicMock(spec=nn.Module)
         mock_compiled = MagicMock()
-        mock_compile.return_value = mock_compiled
+        
+        mock_trt = MagicMock()
+        mock_trt.compile.return_value = mock_compiled
         
         sample_inputs = [torch.randn(1, 4, 64, 64)]
         
-        with patch.dict('sys.modules', {'torch_tensorrt': MagicMock()}):
+        with patch.dict('sys.modules', {'torch_tensorrt': mock_trt}):
             result = builder.compile_torchtrt(mock_model, sample_inputs)
         
-        mock_compile.assert_called_once()
+        # Strategy 1 uses torch_tensorrt.compile(ir="dynamo") as the primary path
+        mock_trt.compile.assert_called_once()
         mock_model.eval.assert_called()
 
     @pytest.mark.unit

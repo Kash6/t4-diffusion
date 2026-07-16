@@ -31,6 +31,7 @@ class TestPipelineConfig:
         
         assert config.model_id == "stabilityai/sdxl-turbo"
         assert config.enable_int8 is True
+        assert config.backend == "quanto"
         assert config.enable_caching is True
         assert config.num_inference_steps == 4
         assert config.guidance_scale == 0.0
@@ -79,11 +80,11 @@ class TestPipelineConfig:
             )
     
     def test_invalid_num_calibration_samples(self):
-        """Test that num_calibration_samples < 100 raises ValueError."""
-        with pytest.raises(ValueError, match="num_calibration_samples must be >= 100"):
+        """Test that num_calibration_samples < 8 raises ValueError."""
+        with pytest.raises(ValueError, match="num_calibration_samples must be >= 8"):
             PipelineConfig(
                 model_id="stabilityai/sdxl-turbo",
-                num_calibration_samples=50,
+                num_calibration_samples=4,
             )
     
     def test_invalid_optimization_level(self):
@@ -93,6 +94,22 @@ class TestPipelineConfig:
                 model_id="stabilityai/sdxl-turbo",
                 optimization_level=6,
             )
+    
+    def test_invalid_backend(self):
+        """Test that an unsupported backend raises ValueError."""
+        with pytest.raises(ValueError, match="Unsupported backend"):
+            PipelineConfig(
+                model_id="stabilityai/sdxl-turbo",
+                backend="onnxruntime",
+            )
+    
+    def test_backend_tensorrt_is_valid(self):
+        """Test that the opt-in 'tensorrt' backend is accepted."""
+        config = PipelineConfig(
+            model_id="stabilityai/sdxl-turbo",
+            backend="tensorrt",
+        )
+        assert config.backend == "tensorrt"
     
     def test_invalid_max_cache_size_gb(self):
         """Test that max_cache_size_gb outside (0, 2.0] raises ValueError."""
@@ -131,14 +148,15 @@ class TestPipelineConfig:
         config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
         
         assert config.enable_int8 is True
+        assert config.backend == "quanto"
         assert config.enable_caching is True
         assert config.cache_interval == 3
         assert config.num_inference_steps == 4
         assert config.guidance_scale == 0.0
         assert config.seed is None
         assert config.image_size == (512, 512)
-        assert config.num_calibration_samples == 512
-        assert config.optimization_level == 5
+        assert config.num_calibration_samples == 32
+        assert config.optimization_level == 3
         assert config.max_cache_size_gb == 2.0
         assert config.exclude_layers is None
 
@@ -435,21 +453,90 @@ class TestOptimizedPipelineWithMocks:
         assert mock_cache.increment_step.call_count == 2
 
 
+class TestApplyQuantoQuantization:
+    """Tests for OptimizedPipeline._apply_quanto_quantization (default backend)."""
+    
+    def test_skips_gracefully_if_quanto_not_installed(self):
+        """Test that a missing optimum-quanto dependency is a soft failure."""
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        pipeline._unet = torch.nn.Linear(4, 4)
+        
+        with patch.dict('sys.modules', {'optimum.quanto': None}):
+            # Should not raise; falls back to FP16 (no quantization applied)
+            pipeline._apply_quanto_quantization()
+        
+        # UNet is untouched (still plain FP32 nn.Linear, not quantized)
+        assert isinstance(pipeline._unet, torch.nn.Linear)
+    
+    def test_skips_if_no_unet(self):
+        """Test that quantization is skipped if no UNet is loaded."""
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        pipeline._unet = None
+        
+        # Should not raise
+        pipeline._apply_quanto_quantization()
+        
+        assert pipeline._unet is None
+    
+    def test_calls_quantize_and_freeze_with_exclusions(self):
+        """Test that quanto's quantize/freeze are called with diffusion exclusions."""
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        mock_unet = MagicMock()
+        pipeline._unet = mock_unet
+        
+        mock_quantize = MagicMock()
+        mock_freeze = MagicMock()
+        mock_quanto_module = MagicMock(
+            quantize=mock_quantize, freeze=mock_freeze, qint8="qint8_sentinel",
+        )
+        
+        with patch.dict('sys.modules', {'optimum.quanto': mock_quanto_module}):
+            pipeline._apply_quanto_quantization()
+        
+        mock_unet.eval.assert_called_once()
+        mock_quantize.assert_called_once()
+        call_kwargs = mock_quantize.call_args.kwargs
+        assert call_kwargs["weights"] == "qint8_sentinel"
+        # Diffusion-specific exclusions should be present as glob patterns
+        assert any("time_embedding" in p for p in call_kwargs["exclude"])
+        assert any("conv_in" in p for p in call_kwargs["exclude"])
+        mock_freeze.assert_called_once_with(mock_unet)
+    
+    def test_falls_back_to_fp16_on_quantize_exception(self):
+        """Test that a quantize() failure is caught and logged, not raised."""
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        mock_unet = MagicMock()
+        pipeline._unet = mock_unet
+        
+        mock_quanto_module = MagicMock()
+        mock_quanto_module.quantize.side_effect = RuntimeError("boom")
+        
+        with patch.dict('sys.modules', {'optimum.quanto': mock_quanto_module}):
+            # Should not raise
+            pipeline._apply_quanto_quantization()
+        
+        # UNet reference unchanged (quantization is in-place; on failure
+        # we just keep whatever state the UNet was left in)
+        assert pipeline._unet is mock_unet
+
+
 class TestOptimizedPipelineFromPretrained:
     """Tests for OptimizedPipeline.from_pretrained class method."""
     
     @patch.object(OptimizedPipeline, '_setup_caching')
-    @patch.object(OptimizedPipeline, '_compile_tensorrt')
-    @patch.object(OptimizedPipeline, '_apply_quantization')
+    @patch.object(OptimizedPipeline, '_apply_quanto_quantization')
     @patch.object(OptimizedPipeline, '_load_model')
     def test_from_pretrained_full_optimization(
         self,
         mock_load,
         mock_quantize,
-        mock_compile,
         mock_cache,
     ):
-        """Test from_pretrained with all optimizations enabled."""
+        """Test from_pretrained with all optimizations enabled (default quanto backend)."""
         config = PipelineConfig(
             model_id="stabilityai/sdxl-turbo",
             enable_int8=True,
@@ -464,7 +551,6 @@ class TestOptimizedPipelineFromPretrained:
         # Verify all optimization steps were called
         mock_load.assert_called_once()
         mock_quantize.assert_called_once()
-        mock_compile.assert_called_once()
         mock_cache.assert_called_once()
         
         assert pipeline.is_optimized is True
@@ -472,10 +558,45 @@ class TestOptimizedPipelineFromPretrained:
     @patch.object(OptimizedPipeline, '_setup_caching')
     @patch.object(OptimizedPipeline, '_compile_tensorrt')
     @patch.object(OptimizedPipeline, '_apply_quantization')
+    @patch.object(OptimizedPipeline, '_apply_quanto_quantization')
+    @patch.object(OptimizedPipeline, '_load_model')
+    def test_from_pretrained_tensorrt_backend(
+        self,
+        mock_load,
+        mock_quanto,
+        mock_quantize,
+        mock_compile,
+        mock_cache,
+    ):
+        """Test from_pretrained dispatches to the opt-in tensorrt backend."""
+        config = PipelineConfig(
+            model_id="stabilityai/sdxl-turbo",
+            enable_int8=True,
+            backend="tensorrt",
+            enable_caching=True,
+        )
+        
+        pipeline = OptimizedPipeline.from_pretrained(
+            "stabilityai/sdxl-turbo",
+            config=config,
+        )
+        
+        # tensorrt backend calls the ONNX+TRT path, not quanto
+        mock_load.assert_called_once()
+        mock_quantize.assert_called_once()
+        mock_compile.assert_called_once()
+        mock_quanto.assert_not_called()
+        mock_cache.assert_called_once()
+    
+    @patch.object(OptimizedPipeline, '_setup_caching')
+    @patch.object(OptimizedPipeline, '_compile_tensorrt')
+    @patch.object(OptimizedPipeline, '_apply_quantization')
+    @patch.object(OptimizedPipeline, '_apply_quanto_quantization')
     @patch.object(OptimizedPipeline, '_load_model')
     def test_from_pretrained_without_int8(
         self,
         mock_load,
+        mock_quanto,
         mock_quantize,
         mock_compile,
         mock_cache,
@@ -494,19 +615,18 @@ class TestOptimizedPipelineFromPretrained:
         
         # Verify quantization and TRT compilation were skipped
         mock_load.assert_called_once()
+        mock_quanto.assert_not_called()
         mock_quantize.assert_not_called()
         mock_compile.assert_not_called()
         mock_cache.assert_called_once()
     
     @patch.object(OptimizedPipeline, '_setup_caching')
-    @patch.object(OptimizedPipeline, '_compile_tensorrt')
-    @patch.object(OptimizedPipeline, '_apply_quantization')
+    @patch.object(OptimizedPipeline, '_apply_quanto_quantization')
     @patch.object(OptimizedPipeline, '_load_model')
     def test_from_pretrained_without_caching(
         self,
         mock_load,
         mock_quantize,
-        mock_compile,
         mock_cache,
     ):
         """Test from_pretrained with caching disabled."""
@@ -524,18 +644,15 @@ class TestOptimizedPipelineFromPretrained:
         # Verify caching was skipped
         mock_load.assert_called_once()
         mock_quantize.assert_called_once()
-        mock_compile.assert_called_once()
         mock_cache.assert_not_called()
     
     @patch.object(OptimizedPipeline, '_setup_caching')
-    @patch.object(OptimizedPipeline, '_compile_tensorrt')
-    @patch.object(OptimizedPipeline, '_apply_quantization')
+    @patch.object(OptimizedPipeline, '_apply_quanto_quantization')
     @patch.object(OptimizedPipeline, '_load_model')
     def test_from_pretrained_creates_default_config(
         self,
         mock_load,
         mock_quantize,
-        mock_compile,
         mock_cache,
     ):
         """Test from_pretrained creates default config if not provided."""
@@ -543,6 +660,7 @@ class TestOptimizedPipelineFromPretrained:
         
         assert pipeline.config.model_id == "stabilityai/sdxl-turbo"
         assert pipeline.config.enable_int8 is True
+        assert pipeline.config.backend == "quanto"
         assert pipeline.config.enable_caching is True
 
 
@@ -618,6 +736,7 @@ class TestEnginePersistence:
         assert 'pipeline_config' in metadata
         assert metadata['pipeline_config']['model_id'] == "stabilityai/sdxl-turbo"
         assert metadata['pipeline_config']['enable_int8'] is True
+        assert metadata['pipeline_config']['backend'] == "quanto"
         assert metadata['pipeline_config']['cache_interval'] == 5
         assert metadata['pipeline_config']['num_inference_steps'] == 8
         assert 'created_at' in metadata
@@ -660,8 +779,8 @@ class TestEnginePersistence:
                 'guidance_scale': 1.5,
                 'seed': 42,
                 'image_size': [512, 512],
-                'num_calibration_samples': 512,
-                'optimization_level': 5,
+                'num_calibration_samples': 32,
+                'optimization_level': 3,
                 'max_cache_size_gb': 2.0,
                 'exclude_layers': None,
             },

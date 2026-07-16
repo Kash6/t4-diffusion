@@ -36,6 +36,7 @@ def main():
     config = PipelineConfig(
         model_id="stabilityai/sdxl-turbo",  # Fast 4-step model
         enable_int8=True,                    # Enable INT8 quantization
+        backend="quanto",                    # Default backend, safe on free-tier Colab
         enable_caching=True,                 # Enable feature caching
         num_inference_steps=4,               # SDXL-Turbo uses 4 steps
         guidance_scale=0.0,                  # No CFG for SDXL-Turbo

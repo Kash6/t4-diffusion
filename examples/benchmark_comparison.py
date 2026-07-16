@@ -99,6 +99,9 @@ def main():
     optimized_config = PipelineConfig(
         model_id=model_id,
         enable_int8=True,
+        backend="quanto",  # Default backend; use "tensorrt" for a bigger
+                            # speedup if you have more host RAM to spare
+                            # (Colab Pro, local GPU) — see README.
         enable_caching=True,
         num_inference_steps=4,
         seed=42,
@@ -111,7 +114,7 @@ def main():
     
     optimized_metrics = run_benchmark(
         optimized_pipeline,
-        "Optimized (INT8 + TRT + Cache)",
+        f"Optimized (INT8 [{optimized_config.backend}] + Cache)",
         prompt,
     )
     

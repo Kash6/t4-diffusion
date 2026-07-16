@@ -105,20 +105,20 @@ class TestCalibrationConfigValidation:
 
     @pytest.mark.unit
     def test_invalid_num_samples_below_minimum(self):
-        """Test that num_samples < 100 raises ValueError."""
-        with pytest.raises(ValueError, match="num_samples must be at least 100"):
-            CalibrationConfig(num_samples=99)
+        """Test that num_samples < 8 raises ValueError."""
+        with pytest.raises(ValueError, match="num_samples must be at least 8"):
+            CalibrationConfig(num_samples=4)
 
     @pytest.mark.unit
     def test_invalid_num_samples_zero(self):
         """Test that num_samples = 0 raises ValueError."""
-        with pytest.raises(ValueError, match="num_samples must be at least 100"):
+        with pytest.raises(ValueError, match="num_samples must be at least 8"):
             CalibrationConfig(num_samples=0)
 
     @pytest.mark.unit
     def test_invalid_num_samples_negative(self):
         """Test that negative num_samples raises ValueError."""
-        with pytest.raises(ValueError, match="num_samples must be at least 100"):
+        with pytest.raises(ValueError, match="num_samples must be at least 8"):
             CalibrationConfig(num_samples=-50)
 
     @pytest.mark.unit
