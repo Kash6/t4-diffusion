@@ -42,6 +42,31 @@ from .utils.vram_monitor import VRAMMonitor, get_vram_usage, clear_cache as vram
 MODEL_WEIGHTS_VRAM_LIMIT_GB = 10.0  # Max VRAM for model weights
 VRAM_WARNING_THRESHOLD_GB = 14.0   # Threshold to trigger cache clearing
 
+# Estimated host RAM spikes for the tensorrt backend's build pipeline,
+# measured empirically (see HANDOFF.md §5.7): the ONNX export step alone
+# spiked host RAM by ~4.3GB on a 32GB local machine, and the TRT engine
+# build itself added another ~1.3GB on top. These are used by
+# estimate_tensorrt_build_requirements() to fail fast with a clear message
+# instead of letting the build silently OOM-kill the process (the failure
+# mode this project spent a lot of time chasing before diagnosing the real
+# cause). Treat these as rough, empirically-derived figures, not a
+# guarantee — actual usage varies by model size and TensorRT version.
+TRT_ONNX_EXPORT_RAM_SPIKE_GB = 4.3
+TRT_ENGINE_BUILD_RAM_SPIKE_GB = 1.3
+TRT_RAM_SAFETY_MARGIN_GB = 1.5
+TRT_RAM_HEADROOM_REQUIRED_GB = (
+    TRT_ONNX_EXPORT_RAM_SPIKE_GB + TRT_ENGINE_BUILD_RAM_SPIKE_GB + TRT_RAM_SAFETY_MARGIN_GB
+)
+
+# Local on-disk cache for built TensorRT engines, keyed by a fingerprint of
+# (model, resolution, quantization config, TensorRT version, GPU). Lets a
+# repeat run with an identical PipelineConfig on the same machine skip
+# quantization + ONNX export + engine build entirely. See
+# OptimizedPipeline._tensorrt_engine_cache_key() for exactly what's
+# fingerprinted. Override the location with the DIFFUSION_TRT_ENGINE_CACHE_DIR
+# environment variable.
+DEFAULT_TRT_ENGINE_CACHE_DIR = Path.home() / ".cache" / "diffusion_trt" / "engines"
+
 # Supported INT8 optimization backends.
 #
 # "quanto" (default): optimum-quanto weight-only INT8 quantization. Pure
@@ -307,8 +332,19 @@ class OptimizedPipeline:
                 # native TRT engine build. Best speedup, but the ONNX export
                 # step alone can spike host RAM by several GB — needs more
                 # RAM headroom than free-tier Colab provides. Opt-in only.
-                pipeline._apply_quantization()
-                pipeline._compile_tensorrt()
+                #
+                # Check the on-disk engine cache BEFORE running calibration —
+                # a cache hit means we can skip quantization entirely too,
+                # not just the ONNX export/build, since a cached engine
+                # already has the quantized weights baked in.
+                if pipeline._try_load_cached_tensorrt_engine():
+                    logger.info(
+                        "Using cached TensorRT engine — skipped quantization, "
+                        "ONNX export, and engine build entirely"
+                    )
+                else:
+                    pipeline._apply_quantization()
+                    pipeline._compile_tensorrt()
         
         # Step 4: Setup feature caching if enabled
         if config.enable_caching:
@@ -395,6 +431,64 @@ class OptimizedPipeline:
                     f"({MODEL_WEIGHTS_VRAM_LIMIT_GB} GB). Consider using a smaller model "
                     f"or enabling CPU offloading."
                 )
+    
+    def _try_load_cached_tensorrt_engine(self) -> bool:
+        """
+        Check the on-disk engine cache before running quantization at all.
+        
+        A cache hit means the fully-built TensorRT engine (quantized weights
+        baked in) already exists on disk from a prior run with an identical
+        configuration — so this skips calibration, quantization, ONNX
+        export, AND the engine build, not just the last two. Called from
+        from_pretrained() before `_apply_quantization()` so the expensive
+        calibration step isn't wasted on a config that's about to hit cache
+        anyway (calling it only from `_compile_tensorrt()` would still catch
+        the ONNX/build cost, but the calibration cost would already be sunk).
+        
+        Returns:
+            True if a cached engine was found and loaded (self._trt_unet and
+            self._pipeline.unet are now set), False on a cache miss.
+        """
+        is_sdxl = self._detect_sdxl()
+        cache_key = self._tensorrt_engine_cache_key(is_sdxl)
+        
+        input_names = ["sample", "timestep", "encoder_hidden_states"]
+        if is_sdxl:
+            input_names += ["text_embeds", "time_ids"]
+        
+        cached_runner = self._load_cached_tensorrt_engine(cache_key, input_names, is_sdxl)
+        if cached_runner is None:
+            return False
+        
+        unet_config = getattr(self._unet, 'config', None)
+        if unet_config is not None:
+            cached_runner.config = unet_config
+        self._trt_unet = cached_runner
+        self._trt_unet_is_sdxl_wrapper = False
+        self._pipeline.unet = self._trt_unet
+        return True
+    
+    def _detect_sdxl(self) -> bool:
+        """
+        Detect whether the loaded pipeline/UNet is an SDXL variant.
+        
+        Checks for a second text encoder first (the clearest signal), then
+        falls back to the UNet's configured cross-attention dimension
+        (SDXL's dual CLIP encoders produce 2048-dim embeddings vs 768 for
+        SD1.5). Used by both the quantization/ONNX-export path and the
+        engine cache fingerprint, so it's factored out to guarantee they
+        agree on the same answer for the same pipeline.
+        """
+        is_sdxl = (
+            hasattr(self._pipeline, 'text_encoder_2') and
+            self._pipeline.text_encoder_2 is not None
+        )
+        if not is_sdxl and self._unet is not None:
+            unet_cfg = getattr(self._unet, 'config', None)
+            if unet_cfg is not None:
+                cross_attn_dim = getattr(unet_cfg, 'cross_attention_dim', 768)
+                is_sdxl = cross_attn_dim == 2048
+        return is_sdxl
     
     def _apply_quanto_quantization(self) -> None:
         """
@@ -711,11 +805,173 @@ class OptimizedPipeline:
             # If validation fails, assume quantization is okay
             return True, []
     
+    @staticmethod
+    def estimate_tensorrt_build_requirements() -> Dict[str, Any]:
+        """
+        Pre-flight check: estimate whether this machine has enough host RAM
+        to survive the tensorrt backend's ONNX export + engine build step.
+        
+        This exists because of a hard-won lesson from debugging this project
+        on free-tier Colab: when the ONNX export step exceeds available host
+        RAM, the OS kills the process with NO Python traceback — the kernel
+        just dies silently. That failure mode cost a lot of debugging time
+        before it was correctly diagnosed as a RAM ceiling rather than a
+        code bug (see HANDOFF.md §5.7). Calling this before
+        `_compile_tensorrt()` lets the pipeline fail with a clear, actionable
+        message instead of crashing invisibly.
+        
+        Returns:
+            Dict with:
+            - available_ram_gb: currently available (not total) host RAM
+            - required_ram_gb: estimated RAM needed for the build to succeed
+            - sufficient: bool, whether available >= required
+            - message: human-readable explanation
+            
+            If `psutil` is not installed, returns sufficient=True with a
+            warning message rather than blocking the build — we can't check
+            what we can't measure, and refusing to run isn't the right
+            default when the check itself is unavailable.
+        """
+        try:
+            import psutil
+        except ImportError:
+            return {
+                "available_ram_gb": None,
+                "required_ram_gb": TRT_RAM_HEADROOM_REQUIRED_GB,
+                "sufficient": True,
+                "message": (
+                    "psutil not installed — cannot check available host RAM "
+                    "before the tensorrt backend's ONNX export/engine build. "
+                    "Proceeding without the pre-flight check. Install psutil "
+                    "for this safety check: pip install psutil"
+                ),
+            }
+        
+        available_gb = psutil.virtual_memory().available / 1e9
+        required_gb = TRT_RAM_HEADROOM_REQUIRED_GB
+        sufficient = available_gb >= required_gb
+        
+        if sufficient:
+            message = (
+                f"{available_gb:.1f}GB host RAM available, "
+                f"~{required_gb:.1f}GB estimated needed for the tensorrt "
+                f"backend's ONNX export + engine build. Should be fine."
+            )
+        else:
+            message = (
+                f"Only {available_gb:.1f}GB host RAM available, but the "
+                f"tensorrt backend's ONNX export + engine build typically "
+                f"needs ~{required_gb:.1f}GB of headroom (the ONNX export "
+                f"step alone can spike usage by ~{TRT_ONNX_EXPORT_RAM_SPIKE_GB:.1f}GB). "
+                f"This will likely crash with no Python traceback (an OS-level "
+                f"OOM kill), not a catchable exception. Free-tier Colab "
+                f"(~12GB host RAM) commonly hits this. Use "
+                f"PipelineConfig(backend='quanto') instead — it has no ONNX "
+                f"export/engine-build step and needs under 1GB of extra RAM. "
+                f"See README's Backends section for details."
+            )
+        
+        return {
+            "available_ram_gb": available_gb,
+            "required_ram_gb": required_gb,
+            "sufficient": sufficient,
+            "message": message,
+        }
+    
+    def _tensorrt_engine_cache_key(self, is_sdxl: bool) -> str:
+        """
+        Compute a fingerprint identifying this exact TensorRT build
+        configuration, used to key the on-disk engine cache.
+        
+        Includes everything that affects the *contents* of the built
+        engine: model, resolution, quantization settings, TensorRT version,
+        and GPU. Deliberately excludes things that don't affect the engine
+        itself (e.g. num_inference_steps, guidance_scale, seed) so unrelated
+        config changes don't cause spurious cache misses.
+        """
+        import hashlib
+        
+        try:
+            import tensorrt as trt
+            trt_version = trt.__version__
+        except ImportError:
+            trt_version = "unknown"
+        
+        gpu_name = "cpu"
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+        
+        fingerprint_parts = [
+            self.config.model_id,
+            f"sdxl={is_sdxl}",
+            f"size={self.config.image_size[0]}x{self.config.image_size[1]}",
+            f"int8={self.config.enable_int8}",
+            f"exclude={sorted(self.config.exclude_layers or [])}",
+            f"trt={trt_version}",
+            f"gpu={gpu_name}",
+        ]
+        fingerprint = "|".join(fingerprint_parts)
+        digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+        logger.debug(f"TRT engine cache fingerprint: {fingerprint} -> {digest}")
+        return digest
+    
+    @staticmethod
+    def _tensorrt_engine_cache_dir() -> Path:
+        """Resolve the on-disk engine cache directory (env-overridable)."""
+        import os as _os
+        override = _os.environ.get("DIFFUSION_TRT_ENGINE_CACHE_DIR")
+        cache_dir = Path(override) if override else DEFAULT_TRT_ENGINE_CACHE_DIR
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+    
+    def _load_cached_tensorrt_engine(
+        self, cache_key: str, input_names: List[str], is_sdxl: bool
+    ) -> Optional[TRTEngineRunner]:
+        """
+        Look up a previously-built engine matching this exact configuration
+        in the local on-disk cache. Returns a ready-to-use TRTEngineRunner
+        on a hit, or None on a miss (including if the cached file is
+        present but fails to load, e.g. because of an undetected TensorRT
+        ABI change — we don't want a stale cache entry to be a hard error,
+        just fall through to a fresh build).
+        """
+        cache_dir = self._tensorrt_engine_cache_dir()
+        engine_path = cache_dir / f"{cache_key}.engine"
+        
+        if not engine_path.exists():
+            return None
+        
+        logger.info(f"TRT engine cache hit: {engine_path}")
+        _progress(f"trt build: skipped, loaded from cache ({engine_path.name})")
+        try:
+            runner = TRTEngineRunner(str(engine_path), input_names, is_sdxl=is_sdxl)
+            return runner
+        except Exception as e:
+            logger.warning(
+                f"Cached TRT engine at {engine_path} failed to load ({e}); "
+                f"rebuilding from scratch."
+            )
+            return None
+    
+    def _save_tensorrt_engine_to_cache(self, cache_key: str, built_engine_path: str) -> None:
+        """Copy a freshly-built engine into the on-disk cache for reuse."""
+        import shutil
+        
+        cache_dir = self._tensorrt_engine_cache_dir()
+        dest_path = cache_dir / f"{cache_key}.engine"
+        try:
+            shutil.copy2(built_engine_path, dest_path)
+            logger.info(f"Cached TRT engine for reuse: {dest_path}")
+        except Exception as e:
+            logger.warning(f"Could not save TRT engine to cache: {e}")
+    
     def _compile_tensorrt(self) -> None:
         """
         Compile the UNet with TensorRT via ONNX export.
         
         Uses the ONNX path for INT8 compilation:
+        0. Check the on-disk engine cache for a matching prior build; use it
+           if present (see _tensorrt_engine_cache_key)
         1. Export the modelopt-quantized UNet to ONNX (preserves QDQ nodes)
         2. Build a native TRT engine from the ONNX file (INT8+FP16 flags)
         3. Wrap the engine in TRTEngineRunner for UNet-compatible inference
@@ -733,6 +989,19 @@ class OptimizedPipeline:
         import os
         
         logger.info("Compiling with TensorRT (ONNX path)")
+        
+        # Pre-flight host RAM check (see estimate_tensorrt_build_requirements).
+        # This can't catch every OOM (available RAM can change during the
+        # build from other processes), but it turns the common case of
+        # "obviously not enough RAM" into a clear upfront warning instead of
+        # a silent, untraceable kernel kill partway through ONNX export.
+        ram_check = self.estimate_tensorrt_build_requirements()
+        logger.info(f"TensorRT build RAM pre-flight check: {ram_check['message']}")
+        if not ram_check["sufficient"]:
+            logger.warning(
+                "Proceeding anyway, but this build is likely to crash with "
+                "no traceback. Consider backend='quanto' instead."
+            )
         
         # FP16 precision — quantizers are folded (SmoothQuant scales baked into
         # weights), TRT applies kernel fusion + memory optimization for speedup.
@@ -766,17 +1035,7 @@ class OptimizedPipeline:
         latent_height = self.config.image_size[0] // 8
         latent_width = self.config.image_size[1] // 8
         
-        # Detect SDXL
-        is_sdxl = (
-            hasattr(self._pipeline, 'text_encoder_2') and
-            self._pipeline.text_encoder_2 is not None
-        )
-        if not is_sdxl and self._unet is not None:
-            unet_cfg = getattr(self._unet, 'config', None)
-            if unet_cfg is not None:
-                cross_attn_dim = getattr(unet_cfg, 'cross_attention_dim', 768)
-                is_sdxl = cross_attn_dim == 2048
-        
+        is_sdxl = self._detect_sdxl()
         logger.info(f"SDXL detected: {is_sdxl}")
         
         encoder_hidden_dim = 2048 if is_sdxl else 768
@@ -792,6 +1051,25 @@ class OptimizedPipeline:
             sample_input["time_ids"] = torch.tensor(
                 [[512.0, 512.0, 0.0, 0.0, 512.0, 512.0]], device="cuda", dtype=torch.float16
             )
+        
+        # Defensive re-check: from_pretrained() already checks the cache via
+        # _try_load_cached_tensorrt_engine() before calling this method (so
+        # calibration/quantization also gets skipped on a hit, not just the
+        # ONNX export/build below). This second check only matters if
+        # _compile_tensorrt() is ever called directly without going through
+        # that path — cheap to keep (a dict lookup + file-exists check).
+        input_names = list(sample_input.keys())
+        cache_key = self._tensorrt_engine_cache_key(is_sdxl)
+        cached_runner = self._load_cached_tensorrt_engine(cache_key, input_names, is_sdxl)
+        if cached_runner is not None:
+            unet_config = getattr(self._unet, 'config', None)
+            if unet_config is not None:
+                cached_runner.config = unet_config
+            self._trt_unet = cached_runner
+            self._trt_unet_is_sdxl_wrapper = False
+            self._pipeline.unet = self._trt_unet
+            logger.info("Using cached TensorRT engine — skipped quantize/export/build")
+            return
         
         if torch.cuda.is_available():
             vram_before = torch.cuda.memory_allocated() / 1e9
@@ -903,6 +1181,11 @@ class OptimizedPipeline:
                 engine_size_mb = os.path.getsize(engine_path) / (1024 * 1024)
                 _progress(f"trt build: complete ({engine_size_mb:.0f} MB)")
                 logger.info(f"TRT engine built: {engine_size_mb:.1f} MB")
+                
+                # Save to the on-disk cache so a future run with an identical
+                # config (see _tensorrt_engine_cache_key) can skip straight to
+                # loading this file instead of rebuilding from scratch.
+                self._save_tensorrt_engine_to_cache(cache_key, engine_path)
                 
                 # Step 3: Load engine into runner
                 logger.info("Step 3: Loading TRT engine runner...")

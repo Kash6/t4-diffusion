@@ -9,7 +9,7 @@ available depending on how much host RAM you have to work with — see
 
 ## Features
 
-- **INT8 Quantization** — two interchangeable backends (Quanto and TensorRT), see below
+- **INT8 Quantization** — two interchangeable backends (Quanto and TensorRT) with different memory/speed tradeoffs, see below
 - **Feature Caching** for additional acceleration
 - **VRAM Monitoring** with 15.6GB T4 limit enforcement
 - **Property-Based Testing** for correctness guarantees
@@ -28,23 +28,60 @@ Colab, not GPU compute or GPU memory.
 | How it works | Quantizes + freezes UNet weights in-place, pure PyTorch ops | ONNX export → native TensorRT INT8 engine build |
 | Extra host RAM needed | ~0.1-1GB | **+4GB or more** during ONNX export alone |
 | Works on free Colab (~12GB RAM)? | Yes | Not reliably — see below |
-| Speedup vs FP16 | Modest (weight memory savings; compute may fall back to dequantize+FP16 depending on kernel support) | Larger (real INT8 tensor-core kernels), but only where it can build |
+| Speedup vs FP16 (measured, RTX 5080, SD1.5, 20 steps) | 0.86x (1100ms vs 947ms baseline — slower, not faster) | 1.95x (486ms vs 947ms baseline) |
 | Best for | Free-tier Colab, laptops, any RAM-constrained box | Colab Pro, local GPUs with 16GB+ system RAM |
 
-**Why `quanto` is the default:** the free-tier Colab T4 has plenty of VRAM
-(15.6GB) but only about 12GB of *host* RAM. The TensorRT path's ONNX export
-step alone can spike host RAM usage by 4GB or more on top of a 7-8GB pipeline
-baseline — that reliably exceeds Colab's ceiling and crashes the kernel with
-no traceback. Quanto quantizes the UNet in-place with no export or engine-build
-step, so there's no tracing/serialization phase to spike during. It was
-verified working end-to-end on a free-tier-equivalent local test (see
-Verification below).
+**Why `quanto` is the default — memory safety, not speed:** the free-tier
+Colab T4 has plenty of VRAM (15.6GB) but only about 12GB of *host* RAM. The
+TensorRT path's ONNX export step alone can spike host RAM usage by 4GB or
+more on top of a 7-8GB pipeline baseline — that reliably exceeds Colab's
+ceiling and crashes the kernel with no traceback. Quanto quantizes the UNet
+in-place with no export or engine-build step, so there's no
+tracing/serialization phase to spike during, and it's verified working
+end-to-end on an actual free-tier T4 (see Performance below).
 
-**Why `tensorrt` is still here:** it gives a real, larger speedup and was
-verified working end-to-end on a local RTX 5080 (SD1.5: ~500ms/20 steps,
-~2 img/s, 1.8GB engine). If you have more host RAM to spare — Colab Pro's
-higher-RAM runtimes, or a local/cloud GPU box — it's worth using. Set
-`backend="tensorrt"` explicitly to opt in.
+Be aware, though: on the hardware we measured (RTX 5080), quanto's
+weight-only INT8 quantization was measurably **slower** than plain FP16
+(0.86x), not faster — likely because that GPU's kernels don't have an
+optimized INT8 GEMM path for this quantization scheme, so it pays
+dequantization overhead without a compute win. Quanto is the default
+because it's the only backend that reliably *runs* on free-tier Colab, not
+because it's faster there. If you need real speedup, use `tensorrt`.
+
+**Why `tensorrt` is still here — real speedup, but needs more RAM:** it
+measured 1.95x faster than FP16 (486ms vs 947ms) on the same local RTX 5080,
+using genuine INT8 tensor-core kernels via a compiled engine. If you have
+host RAM to spare — Colab Pro's higher-RAM runtimes, your own GPU, or a
+cloud GPU box — it's the better choice. Set `backend="tensorrt"` explicitly
+to opt in.
+
+**Before running the `tensorrt` backend**, it's worth checking whether your
+machine has enough host RAM to survive the build:
+
+```python
+from diffusion_trt import OptimizedPipeline
+
+check = OptimizedPipeline.estimate_tensorrt_build_requirements()
+print(check["message"])
+```
+
+This won't catch every OOM (other processes can eat RAM mid-build), but it
+turns the common case of "obviously not enough RAM" into a clear message
+instead of a silent kernel kill. `from_pretrained()` runs this check
+automatically and logs a warning if requirements aren't met, but proceeds
+anyway (it doesn't hard-block, since the check itself can be wrong).
+
+**Repeat builds are cached on disk.** The first `tensorrt` build for a given
+`(model, resolution, quantization config, TensorRT version, GPU)` combination
+is saved to `~/.cache/diffusion_trt/engines/` (override with
+`DIFFUSION_TRT_ENGINE_CACHE_DIR`). A later run with an identical
+configuration on the same machine skips calibration, ONNX export, and the
+engine build entirely, and loads the cached engine directly — turning a
+build that takes ~1-2 minutes into one that takes a couple of seconds. This
+is a local cache only (not shared between machines or users): TensorRT
+engines aren't portable across GPU architectures or TensorRT versions, so a
+cache entry built on one machine won't be reused on another, and reuse
+across unrelated users' machines isn't attempted.
 
 ```python
 from diffusion_trt import OptimizedPipeline, PipelineConfig
@@ -138,22 +175,25 @@ image.save("output.png")
 | Throughput | 0.46-0.51 img/s |
 | Available VRAM headroom | 11.34 GB (of 15.6 GB) |
 
-Measured locally (RTX 5080, SD1.5, 20 steps, 512x512), for comparison:
+Measured locally (RTX 5080, SD1.5, 20 steps, 512x512), including the FP16
+baseline for comparison:
 
-| Backend | Latency | Throughput | Peak VRAM |
-|---|---|---|---|
-| `quanto` | ~1.1s | ~0.9 img/s | ~1.9GB |
-| `tensorrt` | ~0.5s | ~2.0 img/s | ~1.8GB (1.8GB engine) |
+| Backend | Latency | Throughput | Peak VRAM | Speedup vs FP16 |
+|---|---|---|---|---|
+| FP16 (no quantization) | 947ms | 1.06 img/s | 2.64GB | 1.0x (baseline) |
+| `quanto` | 1100ms | 0.91 img/s | 1.91GB | 0.86x (slower) |
+| `tensorrt` | 486ms | 2.06 img/s | 1.03GB (1.8GB engine) | 1.95x |
 
-The 5080 numbers are faster than the T4 numbers above because a 5080 has
-far more raw compute than a T4 — this is expected and not a discrepancy.
-The T4 numbers are the ones that matter for the free-tier default path;
-the local numbers are there to compare the two backends against each other
-on the same hardware. The `tensorrt` backend has not yet been re-verified
-on an actual T4 (it needs more host RAM than free-tier Colab provides — see
-above), but its host-RAM behavior is well understood and its engine build
-succeeds reliably on any machine with sufficient RAM headroom (e.g. Colab
-Pro, local/cloud GPUs).
+The 5080 numbers are faster in absolute terms than the T4 numbers above
+because a 5080 has far more raw compute than a T4 — that part is expected.
+What's less expected: `quanto` was *slower* than doing nothing (plain FP16)
+on this GPU. It still reduces VRAM usage (1.91GB vs 2.64GB), and it's the
+only backend that reliably runs on free-tier Colab, but don't expect it to
+be a speed win by itself — see the Backends section above for why. The
+`tensorrt` backend has not yet been re-verified on an actual T4 (it needs
+more host RAM than free-tier Colab provides), but its host-RAM behavior is
+well understood and its engine build succeeds reliably on any machine with
+sufficient RAM headroom (e.g. Colab Pro, local/cloud GPUs).
 
 ## Notebooks
 

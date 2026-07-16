@@ -524,6 +524,213 @@ class TestApplyQuantoQuantization:
         assert pipeline._unet is mock_unet
 
 
+class TestEstimateTensorrtBuildRequirements:
+    """Tests for OptimizedPipeline.estimate_tensorrt_build_requirements (pre-flight RAM check)."""
+    
+    def test_sufficient_ram_reports_sufficient(self):
+        """Test that plenty of available RAM reports sufficient=True."""
+        mock_psutil = MagicMock()
+        mock_psutil.virtual_memory.return_value = MagicMock(available=32 * 1e9)
+        
+        with patch.dict('sys.modules', {'psutil': mock_psutil}):
+            result = OptimizedPipeline.estimate_tensorrt_build_requirements()
+        
+        assert result["sufficient"] is True
+        assert result["available_ram_gb"] == pytest.approx(32.0, abs=0.1)
+        assert "fine" in result["message"].lower()
+    
+    def test_insufficient_ram_reports_insufficient_with_actionable_message(self):
+        """Test that low available RAM (free-tier-Colab-like) reports insufficient."""
+        mock_psutil = MagicMock()
+        mock_psutil.virtual_memory.return_value = MagicMock(available=3 * 1e9)
+        
+        with patch.dict('sys.modules', {'psutil': mock_psutil}):
+            result = OptimizedPipeline.estimate_tensorrt_build_requirements()
+        
+        assert result["sufficient"] is False
+        assert "quanto" in result["message"]
+        assert "no Python traceback" in result["message"] or "OOM" in result["message"]
+    
+    def test_missing_psutil_defaults_to_sufficient(self):
+        """Test that a missing psutil dependency doesn't block the build."""
+        with patch.dict('sys.modules', {'psutil': None}):
+            result = OptimizedPipeline.estimate_tensorrt_build_requirements()
+        
+        assert result["sufficient"] is True
+        assert result["available_ram_gb"] is None
+        assert "psutil not installed" in result["message"]
+
+
+class TestTensorrtEngineCache:
+    """Tests for the on-disk TensorRT engine cache (cache key, lookup, save)."""
+    
+    def test_cache_key_is_deterministic(self):
+        """Test that identical configs produce identical cache keys."""
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo", image_size=(512, 512))
+        pipeline = OptimizedPipeline(config)
+        
+        key1 = pipeline._tensorrt_engine_cache_key(is_sdxl=True)
+        key2 = pipeline._tensorrt_engine_cache_key(is_sdxl=True)
+        
+        assert key1 == key2
+        assert isinstance(key1, str)
+        assert len(key1) == 16
+    
+    def test_cache_key_differs_by_resolution(self):
+        """Test that different image sizes produce different cache keys."""
+        config_a = PipelineConfig(model_id="stabilityai/sdxl-turbo", image_size=(512, 512))
+        config_b = PipelineConfig(model_id="stabilityai/sdxl-turbo", image_size=(768, 768))
+        
+        key_a = OptimizedPipeline(config_a)._tensorrt_engine_cache_key(is_sdxl=True)
+        key_b = OptimizedPipeline(config_b)._tensorrt_engine_cache_key(is_sdxl=True)
+        
+        assert key_a != key_b
+    
+    def test_cache_key_differs_by_model(self):
+        """Test that different model_ids produce different cache keys."""
+        config_a = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        config_b = PipelineConfig(model_id="runwayml/stable-diffusion-v1-5")
+        
+        key_a = OptimizedPipeline(config_a)._tensorrt_engine_cache_key(is_sdxl=True)
+        key_b = OptimizedPipeline(config_b)._tensorrt_engine_cache_key(is_sdxl=False)
+        
+        assert key_a != key_b
+    
+    def test_cache_dir_respects_env_override(self, tmp_path, monkeypatch):
+        """Test that DIFFUSION_TRT_ENGINE_CACHE_DIR overrides the default location."""
+        custom_dir = tmp_path / "custom_engine_cache"
+        monkeypatch.setenv("DIFFUSION_TRT_ENGINE_CACHE_DIR", str(custom_dir))
+        
+        resolved = OptimizedPipeline._tensorrt_engine_cache_dir()
+        
+        assert resolved == custom_dir
+        assert custom_dir.exists()
+    
+    def test_load_cached_engine_returns_none_on_miss(self, tmp_path, monkeypatch):
+        """Test that a cache miss (no file present) returns None."""
+        monkeypatch.setenv("DIFFUSION_TRT_ENGINE_CACHE_DIR", str(tmp_path))
+        
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        
+        result = pipeline._load_cached_tensorrt_engine(
+            "nonexistent_key", ["sample", "timestep"], is_sdxl=False
+        )
+        
+        assert result is None
+    
+    def test_load_cached_engine_returns_none_if_load_fails(self, tmp_path, monkeypatch):
+        """Test that a corrupt/incompatible cached file is treated as a miss, not an error."""
+        monkeypatch.setenv("DIFFUSION_TRT_ENGINE_CACHE_DIR", str(tmp_path))
+        
+        cache_key = "somekey123"
+        (tmp_path / f"{cache_key}.engine").write_bytes(b"not a real engine")
+        
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        
+        # Should not raise, even though the "engine" file is garbage
+        result = pipeline._load_cached_tensorrt_engine(
+            cache_key, ["sample", "timestep"], is_sdxl=False
+        )
+        
+        assert result is None
+    
+    def test_save_to_cache_copies_file(self, tmp_path, monkeypatch):
+        """Test that a built engine is copied into the cache directory."""
+        cache_root = tmp_path / "cache_root"
+        monkeypatch.setenv("DIFFUSION_TRT_ENGINE_CACHE_DIR", str(cache_root))
+        
+        built_engine = tmp_path / "unet.engine"
+        built_engine.write_bytes(b"fake engine bytes")
+        
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        
+        pipeline._save_tensorrt_engine_to_cache("mykey", str(built_engine))
+        
+        cached_path = cache_root / "mykey.engine"
+        assert cached_path.exists()
+        assert cached_path.read_bytes() == b"fake engine bytes"
+    
+    def test_save_to_cache_does_not_raise_on_failure(self, tmp_path, monkeypatch):
+        """Test that a cache-save failure is logged, not raised (non-critical path)."""
+        monkeypatch.setenv("DIFFUSION_TRT_ENGINE_CACHE_DIR", str(tmp_path))
+        
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        
+        # Source file doesn't exist -> shutil.copy2 will raise internally,
+        # but the method should swallow it.
+        pipeline._save_tensorrt_engine_to_cache("mykey", str(tmp_path / "does_not_exist.engine"))
+
+
+class TestTryLoadCachedTensorrtEngine:
+    """Tests for OptimizedPipeline._try_load_cached_tensorrt_engine."""
+    
+    def test_returns_false_on_cache_miss(self, tmp_path, monkeypatch):
+        """Test that a cache miss returns False without touching pipeline state."""
+        monkeypatch.setenv("DIFFUSION_TRT_ENGINE_CACHE_DIR", str(tmp_path))
+        
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo", backend="tensorrt")
+        pipeline = OptimizedPipeline(config)
+        pipeline._pipeline = MagicMock(text_encoder_2=None)
+        pipeline._unet = MagicMock(config=MagicMock(cross_attention_dim=768))
+        
+        result = pipeline._try_load_cached_tensorrt_engine()
+        
+        assert result is False
+        assert pipeline._trt_unet is None
+    
+    def test_returns_true_and_sets_trt_unet_on_cache_hit(self, tmp_path, monkeypatch):
+        """Test that a cache hit sets self._trt_unet and returns True."""
+        monkeypatch.setenv("DIFFUSION_TRT_ENGINE_CACHE_DIR", str(tmp_path))
+        
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo", backend="tensorrt")
+        pipeline = OptimizedPipeline(config)
+        pipeline._pipeline = MagicMock(text_encoder_2=None)
+        pipeline._unet = MagicMock(config=MagicMock(cross_attention_dim=768))
+        
+        mock_runner = MagicMock()
+        with patch.object(
+            OptimizedPipeline, '_load_cached_tensorrt_engine', return_value=mock_runner
+        ):
+            result = pipeline._try_load_cached_tensorrt_engine()
+        
+        assert result is True
+        assert pipeline._trt_unet is mock_runner
+        assert pipeline._pipeline.unet is mock_runner
+
+
+class TestDetectSdxl:
+    """Tests for OptimizedPipeline._detect_sdxl."""
+    
+    def test_detects_sdxl_via_text_encoder_2(self):
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        pipeline._pipeline = MagicMock(text_encoder_2=MagicMock())
+        pipeline._unet = None
+        
+        assert pipeline._detect_sdxl() is True
+    
+    def test_detects_sd15_without_text_encoder_2(self):
+        config = PipelineConfig(model_id="runwayml/stable-diffusion-v1-5")
+        pipeline = OptimizedPipeline(config)
+        pipeline._pipeline = MagicMock(text_encoder_2=None)
+        pipeline._unet = MagicMock(config=MagicMock(cross_attention_dim=768))
+        
+        assert pipeline._detect_sdxl() is False
+    
+    def test_falls_back_to_unet_cross_attention_dim(self):
+        """Test SDXL detection via UNet config when text_encoder_2 is absent."""
+        config = PipelineConfig(model_id="stabilityai/sdxl-turbo")
+        pipeline = OptimizedPipeline(config)
+        pipeline._pipeline = MagicMock(spec=[])  # no text_encoder_2 attribute at all
+        pipeline._unet = MagicMock(config=MagicMock(cross_attention_dim=2048))
+        
+        assert pipeline._detect_sdxl() is True
+
+
 class TestOptimizedPipelineFromPretrained:
     """Tests for OptimizedPipeline.from_pretrained class method."""
     
@@ -587,6 +794,42 @@ class TestOptimizedPipelineFromPretrained:
         mock_compile.assert_called_once()
         mock_quanto.assert_not_called()
         mock_cache.assert_called_once()
+    
+    @patch.object(OptimizedPipeline, '_setup_caching')
+    @patch.object(OptimizedPipeline, '_try_load_cached_tensorrt_engine')
+    @patch.object(OptimizedPipeline, '_compile_tensorrt')
+    @patch.object(OptimizedPipeline, '_apply_quantization')
+    @patch.object(OptimizedPipeline, '_load_model')
+    def test_from_pretrained_tensorrt_backend_skips_quantize_on_cache_hit(
+        self,
+        mock_load,
+        mock_quantize,
+        mock_compile,
+        mock_try_cache,
+        mock_cache,
+    ):
+        """Test that a TRT engine cache hit skips quantization AND compilation."""
+        mock_try_cache.return_value = True
+        
+        config = PipelineConfig(
+            model_id="stabilityai/sdxl-turbo",
+            enable_int8=True,
+            backend="tensorrt",
+            enable_caching=True,
+        )
+        
+        pipeline = OptimizedPipeline.from_pretrained(
+            "stabilityai/sdxl-turbo",
+            config=config,
+        )
+        
+        mock_try_cache.assert_called_once()
+        # Cache hit means the (expensive) calibration/quantization step is
+        # skipped entirely, not just the ONNX export/build.
+        mock_quantize.assert_not_called()
+        mock_compile.assert_not_called()
+        mock_cache.assert_called_once()
+        assert pipeline.is_optimized is True
     
     @patch.object(OptimizedPipeline, '_setup_caching')
     @patch.object(OptimizedPipeline, '_compile_tensorrt')
